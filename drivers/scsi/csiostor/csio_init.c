@@ -113,12 +113,9 @@ static const struct file_operations csio_mem_debugfs_fops = {
 void csio_add_debugfs_mem(struct csio_hw *hw, const char *name,
 				 unsigned int idx, unsigned int size_mb)
 {
-	struct dentry *de;
-
-	de = debugfs_create_file(name, S_IRUSR, hw->debugfs_root,
-				 (void *)hw + idx, &csio_mem_debugfs_fops);
-	if (de && de->d_inode)
-		de->d_inode->i_size = size_mb << 20;
+	debugfs_create_file_size(name, S_IRUSR, hw->debugfs_root,
+				 (void *)hw + idx, &csio_mem_debugfs_fops,
+				 size_mb << 20);
 }
 
 static int csio_setup_debugfs(struct csio_hw *hw)
@@ -488,9 +485,10 @@ csio_resource_alloc(struct csio_hw *hw)
 	if (!hw->rnode_mempool)
 		goto err_free_mb_mempool;
 
-	hw->scsi_pci_pool = pci_pool_create("csio_scsi_pci_pool", hw->pdev,
-					    CSIO_SCSI_RSP_LEN, 8, 0);
-	if (!hw->scsi_pci_pool)
+	hw->scsi_dma_pool = dma_pool_create("csio_scsi_dma_pool",
+					    &hw->pdev->dev, CSIO_SCSI_RSP_LEN,
+					    8, 0);
+	if (!hw->scsi_dma_pool)
 		goto err_free_rn_pool;
 
 	return 0;
@@ -508,8 +506,8 @@ err:
 static void
 csio_resource_free(struct csio_hw *hw)
 {
-	pci_pool_destroy(hw->scsi_pci_pool);
-	hw->scsi_pci_pool = NULL;
+	dma_pool_destroy(hw->scsi_dma_pool);
+	hw->scsi_dma_pool = NULL;
 	mempool_destroy(hw->rnode_mempool);
 	hw->rnode_mempool = NULL;
 	mempool_destroy(hw->mb_mempool);
@@ -955,8 +953,9 @@ static int csio_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct csio_hw *hw;
 	struct csio_lnode *ln;
 
-	/* probe only T5 cards */
-	if (!csio_is_t5((pdev->device & CSIO_HW_CHIP_MASK)))
+	/* probe only T5 and T6 cards */
+	if (!csio_is_t5((pdev->device & CSIO_HW_CHIP_MASK)) &&
+	    !csio_is_t6((pdev->device & CSIO_HW_CHIP_MASK)))
 		return -ENODEV;
 
 	rv = csio_pci_init(pdev, &bars);
@@ -969,12 +968,19 @@ static int csio_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto err_pci_exit;
 	}
 
+	if (!pcie_relaxed_ordering_enabled(pdev))
+		hw->flags |= CSIO_HWF_ROOT_NO_RELAXED_ORDERING;
+
 	pci_set_drvdata(pdev, hw);
 
-	if (csio_hw_start(hw) != 0) {
-		dev_err(&pdev->dev,
-			"Failed to start FW, continuing in debug mode.\n");
-		return 0;
+	rv = csio_hw_start(hw);
+	if (rv) {
+		if (rv == -EINVAL) {
+			dev_err(&pdev->dev,
+				"Failed to start FW, continuing in debug mode.\n");
+			return 0;
+		}
+		goto err_lnode_exit;
 	}
 
 	sprintf(hw->fwrev_str, "%u.%u.%u.%u\n",
@@ -1175,10 +1181,9 @@ static struct pci_error_handlers csio_err_handler = {
  *  Macros needed to support the PCI Device ID Table ...
  */
 #define CH_PCI_DEVICE_ID_TABLE_DEFINE_BEGIN \
-	static struct pci_device_id csio_pci_tbl[] = {
-/* Define for iSCSI uses PF5, FCoE uses PF6 */
-#define CH_PCI_DEVICE_ID_FUNCTION	0x5
-#define CH_PCI_DEVICE_ID_FUNCTION2	0x6
+	static const struct pci_device_id csio_pci_tbl[] = {
+/* Define for FCoE uses PF6 */
+#define CH_PCI_DEVICE_ID_FUNCTION	0x6
 
 #define CH_PCI_ID_TABLE_ENTRY(devid) \
 		{ PCI_VDEVICE(CHELSIO, (devid)), 0 }
@@ -1253,8 +1258,8 @@ module_init(csio_init);
 module_exit(csio_exit);
 MODULE_AUTHOR(CSIO_DRV_AUTHOR);
 MODULE_DESCRIPTION(CSIO_DRV_DESC);
-MODULE_LICENSE(CSIO_DRV_LICENSE);
+MODULE_LICENSE("Dual BSD/GPL");
 MODULE_DEVICE_TABLE(pci, csio_pci_tbl);
 MODULE_VERSION(CSIO_DRV_VERSION);
-MODULE_FIRMWARE(FW_FNAME_T4);
 MODULE_FIRMWARE(FW_FNAME_T5);
+MODULE_FIRMWARE(FW_FNAME_T6);

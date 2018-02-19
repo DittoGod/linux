@@ -24,6 +24,13 @@ $(obj)/vmImage: $(obj)/vmlinux.gz
 	$(call if_changed,uimage)
 	@$(kecho) 'Kernel: $@ is ready'
 
+$(obj)/zImage: $(obj)/compressed/vmlinux FORCE
+	$(call if_changed,objcopy)
+	@$(kecho) 'Kernel: $@ is ready'
+
+$(obj)/compressed/vmlinux: $(obj)/vmlinux.gz FORCE
+	$(Q)$(MAKE) $(build)=$(obj)/compressed $@
+
 # Rule to build device tree blobs
 DTB_SRC := $(patsubst "%",%,$(CONFIG_NIOS2_DTB_SOURCE))
 
@@ -45,8 +52,6 @@ $(obj)/%.dtb: $(src)/dts/%.dts FORCE
 	$(call if_changed_dep,dtc)
 
 $(obj)/dtbs: $(addprefix $(obj)/, $(dtb-y))
-
-clean-files := *.dtb
 
 install:
 	sh $(srctree)/$(src)/install.sh $(KERNELRELEASE) $(BOOTIMAGE) System.map "$(INSTALL_PATH)"

@@ -1,7 +1,7 @@
 /*
  * net/tipc/name_table.c: TIPC name table code
  *
- * Copyright (c) 2000-2006, 2014, Ericsson AB
+ * Copyright (c) 2000-2006, 2014-2015, Ericsson AB
  * Copyright (c) 2004-2008, 2010-2014, Wind River Systems
  * All rights reserved.
  *
@@ -34,19 +34,19 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <net/sock.h>
 #include "core.h"
-#include "config.h"
+#include "netlink.h"
 #include "name_table.h"
 #include "name_distr.h"
 #include "subscr.h"
+#include "bcast.h"
+#include "addr.h"
+#include "node.h"
+#include "group.h"
+#include <net/genetlink.h>
 
 #define TIPC_NAMETBL_SIZE 1024		/* must be a power of 2 */
-
-static const struct nla_policy
-tipc_nl_name_table_policy[TIPC_NLA_NAME_TABLE_MAX + 1] = {
-	[TIPC_NLA_NAME_TABLE_UNSPEC]	= { .type = NLA_UNSPEC },
-	[TIPC_NLA_NAME_TABLE_PUBL]	= { .type = NLA_NESTED }
-};
 
 /**
  * struct name_info - name sequence publication info
@@ -104,9 +104,6 @@ struct name_seq {
 	spinlock_t lock;
 	struct rcu_head rcu;
 };
-
-struct name_table *tipc_nametbl;
-DEFINE_SPINLOCK(tipc_nametbl_lock);
 
 static int hash(int x)
 {
@@ -228,9 +225,11 @@ static u32 nameseq_locate_subseq(struct name_seq *nseq, u32 instance)
 /**
  * tipc_nameseq_insert_publ
  */
-static struct publication *tipc_nameseq_insert_publ(struct name_seq *nseq,
-						    u32 type, u32 lower, u32 upper,
-						    u32 scope, u32 node, u32 port, u32 key)
+static struct publication *tipc_nameseq_insert_publ(struct net *net,
+						    struct name_seq *nseq,
+						    u32 type, u32 lower,
+						    u32 upper, u32 scope,
+						    u32 node, u32 port, u32 key)
 {
 	struct tipc_subscription *s;
 	struct tipc_subscription *st;
@@ -315,25 +314,22 @@ static struct publication *tipc_nameseq_insert_publ(struct name_seq *nseq,
 	list_add(&publ->zone_list, &info->zone_list);
 	info->zone_list_size++;
 
-	if (in_own_cluster(node)) {
+	if (in_own_cluster(net, node)) {
 		list_add(&publ->cluster_list, &info->cluster_list);
 		info->cluster_list_size++;
 	}
 
-	if (in_own_node(node)) {
+	if (in_own_node(net, node)) {
 		list_add(&publ->node_list, &info->node_list);
 		info->node_list_size++;
 	}
 
 	/* Any subscriptions waiting for notification?  */
 	list_for_each_entry_safe(s, st, &nseq->subscriptions, nameseq_list) {
-		tipc_subscr_report_overlap(s,
-					   publ->lower,
-					   publ->upper,
-					   TIPC_PUBLISHED,
-					   publ->ref,
-					   publ->node,
-					   created_subseq);
+		tipc_subscrp_report_overlap(s, publ->lower, publ->upper,
+					    TIPC_PUBLISHED, publ->ref,
+					    publ->node, publ->scope,
+					    created_subseq);
 	}
 	return publ;
 }
@@ -349,8 +345,10 @@ static struct publication *tipc_nameseq_insert_publ(struct name_seq *nseq,
  * A failed withdraw request simply returns a failure indication and lets the
  * caller issue any error or warning messages associated with such a problem.
  */
-static struct publication *tipc_nameseq_remove_publ(struct name_seq *nseq, u32 inst,
-						    u32 node, u32 ref, u32 key)
+static struct publication *tipc_nameseq_remove_publ(struct net *net,
+						    struct name_seq *nseq,
+						    u32 inst, u32 node,
+						    u32 ref, u32 key)
 {
 	struct publication *publ;
 	struct sub_seq *sseq = nameseq_find_subseq(nseq, inst);
@@ -378,13 +376,13 @@ found:
 	info->zone_list_size--;
 
 	/* Remove publication from cluster scope list, if present */
-	if (in_own_cluster(node)) {
+	if (in_own_cluster(net, node)) {
 		list_del(&publ->cluster_list);
 		info->cluster_list_size--;
 	}
 
 	/* Remove publication from node scope list, if present */
-	if (in_own_node(node)) {
+	if (in_own_node(net, node)) {
 		list_del(&publ->node_list);
 		info->node_list_size--;
 	}
@@ -399,47 +397,48 @@ found:
 
 	/* Notify any waiting subscriptions */
 	list_for_each_entry_safe(s, st, &nseq->subscriptions, nameseq_list) {
-		tipc_subscr_report_overlap(s,
-					   publ->lower,
-					   publ->upper,
-					   TIPC_WITHDRAWN,
-					   publ->ref,
-					   publ->node,
-					   removed_subseq);
+		tipc_subscrp_report_overlap(s, publ->lower, publ->upper,
+					    TIPC_WITHDRAWN, publ->ref,
+					    publ->node, publ->scope,
+					    removed_subseq);
 	}
 
 	return publ;
 }
 
 /**
- * tipc_nameseq_subscribe - attach a subscription, and issue
- * the prescribed number of events if there is any sub-
+ * tipc_nameseq_subscribe - attach a subscription, and optionally
+ * issue the prescribed number of events if there is any sub-
  * sequence overlapping with the requested sequence
  */
 static void tipc_nameseq_subscribe(struct name_seq *nseq,
-				   struct tipc_subscription *s)
+				   struct tipc_subscription *s,
+				   bool status)
 {
 	struct sub_seq *sseq = nseq->sseqs;
+	struct tipc_name_seq ns;
 
+	tipc_subscrp_convert_seq(&s->evt.s.seq, s->swap, &ns);
+
+	tipc_subscrp_get(s);
 	list_add(&s->nameseq_list, &nseq->subscriptions);
 
-	if (!sseq)
+	if (!status || !sseq)
 		return;
 
 	while (sseq != &nseq->sseqs[nseq->first_free]) {
-		if (tipc_subscr_overlap(s, sseq->lower, sseq->upper)) {
+		if (tipc_subscrp_check_overlap(&ns, sseq->lower, sseq->upper)) {
 			struct publication *crs;
 			struct name_info *info = sseq->info;
 			int must_report = 1;
 
 			list_for_each_entry(crs, &info->zone_list, zone_list) {
-				tipc_subscr_report_overlap(s,
-							   sseq->lower,
-							   sseq->upper,
-							   TIPC_PUBLISHED,
-							   crs->ref,
-							   crs->node,
-							   must_report);
+				tipc_subscrp_report_overlap(s, sseq->lower,
+							    sseq->upper,
+							    TIPC_PUBLISHED,
+							    crs->ref, crs->node,
+							    crs->scope,
+							    must_report);
 				must_report = 0;
 			}
 		}
@@ -447,12 +446,13 @@ static void tipc_nameseq_subscribe(struct name_seq *nseq,
 	}
 }
 
-static struct name_seq *nametbl_find_seq(u32 type)
+static struct name_seq *nametbl_find_seq(struct net *net, u32 type)
 {
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
 	struct hlist_head *seq_head;
 	struct name_seq *ns;
 
-	seq_head = &tipc_nametbl->seq_hlist[hash(type)];
+	seq_head = &tn->nametbl->seq_hlist[hash(type)];
 	hlist_for_each_entry_rcu(ns, seq_head, ns_list) {
 		if (ns->type == type)
 			return ns;
@@ -461,11 +461,13 @@ static struct name_seq *nametbl_find_seq(u32 type)
 	return NULL;
 };
 
-struct publication *tipc_nametbl_insert_publ(u32 type, u32 lower, u32 upper,
-					     u32 scope, u32 node, u32 port, u32 key)
+struct publication *tipc_nametbl_insert_publ(struct net *net, u32 type,
+					     u32 lower, u32 upper, u32 scope,
+					     u32 node, u32 port, u32 key)
 {
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
 	struct publication *publ;
-	struct name_seq *seq = nametbl_find_seq(type);
+	struct name_seq *seq = nametbl_find_seq(net, type);
 	int index = hash(type);
 
 	if ((scope < TIPC_ZONE_SCOPE) || (scope > TIPC_NODE_SCOPE) ||
@@ -476,29 +478,29 @@ struct publication *tipc_nametbl_insert_publ(u32 type, u32 lower, u32 upper,
 	}
 
 	if (!seq)
-		seq = tipc_nameseq_create(type,
-					  &tipc_nametbl->seq_hlist[index]);
+		seq = tipc_nameseq_create(type, &tn->nametbl->seq_hlist[index]);
 	if (!seq)
 		return NULL;
 
 	spin_lock_bh(&seq->lock);
-	publ = tipc_nameseq_insert_publ(seq, type, lower, upper,
+	publ = tipc_nameseq_insert_publ(net, seq, type, lower, upper,
 					scope, node, port, key);
 	spin_unlock_bh(&seq->lock);
 	return publ;
 }
 
-struct publication *tipc_nametbl_remove_publ(u32 type, u32 lower,
-					     u32 node, u32 ref, u32 key)
+struct publication *tipc_nametbl_remove_publ(struct net *net, u32 type,
+					     u32 lower, u32 node, u32 ref,
+					     u32 key)
 {
 	struct publication *publ;
-	struct name_seq *seq = nametbl_find_seq(type);
+	struct name_seq *seq = nametbl_find_seq(net, type);
 
 	if (!seq)
 		return NULL;
 
 	spin_lock_bh(&seq->lock);
-	publ = tipc_nameseq_remove_publ(seq, lower, node, ref, key);
+	publ = tipc_nameseq_remove_publ(net, seq, lower, node, ref, key);
 	if (!seq->first_free && list_empty(&seq->subscriptions)) {
 		hlist_del_init_rcu(&seq->ns_list);
 		kfree(seq->sseqs);
@@ -523,8 +525,10 @@ struct publication *tipc_nametbl_remove_publ(u32 type, u32 lower,
  * - if name translation is attempted and fails, sets 'destnode' to 0
  *   and returns 0
  */
-u32 tipc_nametbl_translate(u32 type, u32 instance, u32 *destnode)
+u32 tipc_nametbl_translate(struct net *net, u32 type, u32 instance,
+			   u32 *destnode)
 {
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
 	struct sub_seq *sseq;
 	struct name_info *info;
 	struct publication *publ;
@@ -532,11 +536,11 @@ u32 tipc_nametbl_translate(u32 type, u32 instance, u32 *destnode)
 	u32 ref = 0;
 	u32 node = 0;
 
-	if (!tipc_in_scope(*destnode, tipc_own_addr))
+	if (!tipc_in_scope(*destnode, tn->own_addr))
 		return 0;
 
 	rcu_read_lock();
-	seq = nametbl_find_seq(type);
+	seq = nametbl_find_seq(net, type);
 	if (unlikely(!seq))
 		goto not_found;
 	spin_lock_bh(&seq->lock);
@@ -569,13 +573,13 @@ u32 tipc_nametbl_translate(u32 type, u32 instance, u32 *destnode)
 	}
 
 	/* Round-Robin Algorithm */
-	else if (*destnode == tipc_own_addr) {
+	else if (*destnode == tn->own_addr) {
 		if (list_empty(&info->node_list))
 			goto no_match;
 		publ = list_first_entry(&info->node_list, struct publication,
 					node_list);
 		list_move_tail(&publ->node_list, &info->node_list);
-	} else if (in_own_cluster_exact(*destnode)) {
+	} else if (in_own_cluster_exact(net, *destnode)) {
 		if (list_empty(&info->cluster_list))
 			goto no_match;
 		publ = list_first_entry(&info->cluster_list, struct publication,
@@ -597,29 +601,56 @@ not_found:
 	return ref;
 }
 
-/**
- * tipc_nametbl_mc_translate - find multicast destinations
- *
- * Creates list of all local ports that overlap the given multicast address;
- * also determines if any off-node ports overlap.
- *
- * Note: Publications with a scope narrower than 'limit' are ignored.
- * (i.e. local node-scope publications mustn't receive messages arriving
- * from another node, even if the multcast link brought it here)
- *
- * Returns non-zero if any off-node ports overlap
- */
-int tipc_nametbl_mc_translate(u32 type, u32 lower, u32 upper, u32 limit,
-			      struct tipc_port_list *dports)
+bool tipc_nametbl_lookup(struct net *net, u32 type, u32 instance, u32 scope,
+			 struct list_head *dsts, int *dstcnt, u32 exclude,
+			 bool all)
 {
+	u32 self = tipc_own_addr(net);
+	struct publication *publ;
+	struct name_info *info;
 	struct name_seq *seq;
 	struct sub_seq *sseq;
+
+	*dstcnt = 0;
+	rcu_read_lock();
+	seq = nametbl_find_seq(net, type);
+	if (unlikely(!seq))
+		goto exit;
+	spin_lock_bh(&seq->lock);
+	sseq = nameseq_find_subseq(seq, instance);
+	if (likely(sseq)) {
+		info = sseq->info;
+		list_for_each_entry(publ, &info->zone_list, zone_list) {
+			if (publ->scope != scope)
+				continue;
+			if (publ->ref == exclude && publ->node == self)
+				continue;
+			tipc_dest_push(dsts, publ->node, publ->ref);
+			(*dstcnt)++;
+			if (all)
+				continue;
+			list_move_tail(&publ->zone_list, &info->zone_list);
+			break;
+		}
+	}
+	spin_unlock_bh(&seq->lock);
+exit:
+	rcu_read_unlock();
+	return !list_empty(dsts);
+}
+
+int tipc_nametbl_mc_lookup(struct net *net, u32 type, u32 lower, u32 upper,
+			   u32 scope, bool exact, struct list_head *dports)
+{
 	struct sub_seq *sseq_stop;
 	struct name_info *info;
+	struct publication *p;
+	struct name_seq *seq;
+	struct sub_seq *sseq;
 	int res = 0;
 
 	rcu_read_lock();
-	seq = nametbl_find_seq(type);
+	seq = nametbl_find_seq(net, type);
 	if (!seq)
 		goto exit;
 
@@ -627,15 +658,12 @@ int tipc_nametbl_mc_translate(u32 type, u32 lower, u32 upper, u32 limit,
 	sseq = seq->sseqs + nameseq_locate_subseq(seq, lower);
 	sseq_stop = seq->sseqs + seq->first_free;
 	for (; sseq != sseq_stop; sseq++) {
-		struct publication *publ;
-
 		if (sseq->lower > upper)
 			break;
-
 		info = sseq->info;
-		list_for_each_entry(publ, &info->node_list, node_list) {
-			if (publ->scope <= limit)
-				tipc_port_list_add(dports, publ->ref);
+		list_for_each_entry(p, &info->node_list, node_list) {
+			if (p->scope == scope || (!exact && p->scope < scope))
+				tipc_dest_push(dports, 0, p->ref);
 		}
 
 		if (info->cluster_list_size != info->node_list_size)
@@ -647,53 +675,120 @@ exit:
 	return res;
 }
 
+/* tipc_nametbl_lookup_dst_nodes - find broadcast destination nodes
+ * - Creates list of nodes that overlap the given multicast address
+ * - Determines if any node local ports overlap
+ */
+void tipc_nametbl_lookup_dst_nodes(struct net *net, u32 type, u32 lower,
+				   u32 upper, struct tipc_nlist *nodes)
+{
+	struct sub_seq *sseq, *stop;
+	struct publication *publ;
+	struct name_info *info;
+	struct name_seq *seq;
+
+	rcu_read_lock();
+	seq = nametbl_find_seq(net, type);
+	if (!seq)
+		goto exit;
+
+	spin_lock_bh(&seq->lock);
+	sseq = seq->sseqs + nameseq_locate_subseq(seq, lower);
+	stop = seq->sseqs + seq->first_free;
+	for (; sseq != stop && sseq->lower <= upper; sseq++) {
+		info = sseq->info;
+		list_for_each_entry(publ, &info->zone_list, zone_list) {
+			tipc_nlist_add(nodes, publ->node);
+		}
+	}
+	spin_unlock_bh(&seq->lock);
+exit:
+	rcu_read_unlock();
+}
+
+/* tipc_nametbl_build_group - build list of communication group members
+ */
+void tipc_nametbl_build_group(struct net *net, struct tipc_group *grp,
+			      u32 type, u32 scope)
+{
+	struct sub_seq *sseq, *stop;
+	struct name_info *info;
+	struct publication *p;
+	struct name_seq *seq;
+
+	rcu_read_lock();
+	seq = nametbl_find_seq(net, type);
+	if (!seq)
+		goto exit;
+
+	spin_lock_bh(&seq->lock);
+	sseq = seq->sseqs;
+	stop = seq->sseqs + seq->first_free;
+	for (; sseq != stop; sseq++) {
+		info = sseq->info;
+		list_for_each_entry(p, &info->zone_list, zone_list) {
+			if (p->scope != scope)
+				continue;
+			tipc_group_add_member(grp, p->node, p->ref, p->lower);
+		}
+	}
+	spin_unlock_bh(&seq->lock);
+exit:
+	rcu_read_unlock();
+}
+
 /*
  * tipc_nametbl_publish - add name publication to network name tables
  */
-struct publication *tipc_nametbl_publish(u32 type, u32 lower, u32 upper,
-					 u32 scope, u32 port_ref, u32 key)
+struct publication *tipc_nametbl_publish(struct net *net, u32 type, u32 lower,
+					 u32 upper, u32 scope, u32 port_ref,
+					 u32 key)
 {
 	struct publication *publ;
 	struct sk_buff *buf = NULL;
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
 
-	spin_lock_bh(&tipc_nametbl_lock);
-	if (tipc_nametbl->local_publ_count >= TIPC_MAX_PUBLICATIONS) {
+	spin_lock_bh(&tn->nametbl_lock);
+	if (tn->nametbl->local_publ_count >= TIPC_MAX_PUBLICATIONS) {
 		pr_warn("Publication failed, local publication limit reached (%u)\n",
 			TIPC_MAX_PUBLICATIONS);
-		spin_unlock_bh(&tipc_nametbl_lock);
+		spin_unlock_bh(&tn->nametbl_lock);
 		return NULL;
 	}
 
-	publ = tipc_nametbl_insert_publ(type, lower, upper, scope,
-				   tipc_own_addr, port_ref, key);
+	publ = tipc_nametbl_insert_publ(net, type, lower, upper, scope,
+					tn->own_addr, port_ref, key);
 	if (likely(publ)) {
-		tipc_nametbl->local_publ_count++;
-		buf = tipc_named_publish(publ);
+		tn->nametbl->local_publ_count++;
+		buf = tipc_named_publish(net, publ);
 		/* Any pending external events? */
-		tipc_named_process_backlog();
+		tipc_named_process_backlog(net);
 	}
-	spin_unlock_bh(&tipc_nametbl_lock);
+	spin_unlock_bh(&tn->nametbl_lock);
 
 	if (buf)
-		named_cluster_distribute(buf);
+		tipc_node_broadcast(net, buf);
 	return publ;
 }
 
 /**
  * tipc_nametbl_withdraw - withdraw name publication from network name tables
  */
-int tipc_nametbl_withdraw(u32 type, u32 lower, u32 ref, u32 key)
+int tipc_nametbl_withdraw(struct net *net, u32 type, u32 lower, u32 ref,
+			  u32 key)
 {
 	struct publication *publ;
 	struct sk_buff *skb = NULL;
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
 
-	spin_lock_bh(&tipc_nametbl_lock);
-	publ = tipc_nametbl_remove_publ(type, lower, tipc_own_addr, ref, key);
+	spin_lock_bh(&tn->nametbl_lock);
+	publ = tipc_nametbl_remove_publ(net, type, lower, tn->own_addr,
+					ref, key);
 	if (likely(publ)) {
-		tipc_nametbl->local_publ_count--;
-		skb = tipc_named_withdraw(publ);
+		tn->nametbl->local_publ_count--;
+		skb = tipc_named_withdraw(net, publ);
 		/* Any pending external events? */
-		tipc_named_process_backlog();
+		tipc_named_process_backlog(net);
 		list_del_init(&publ->pport_list);
 		kfree_rcu(publ, rcu);
 	} else {
@@ -701,10 +796,10 @@ int tipc_nametbl_withdraw(u32 type, u32 lower, u32 ref, u32 key)
 		       "(type=%u, lower=%u, ref=%u, key=%u)\n",
 		       type, lower, ref, key);
 	}
-	spin_unlock_bh(&tipc_nametbl_lock);
+	spin_unlock_bh(&tn->nametbl_lock);
 
 	if (skb) {
-		named_cluster_distribute(skb);
+		tipc_node_broadcast(net, skb);
 		return 1;
 	}
 	return 0;
@@ -713,26 +808,28 @@ int tipc_nametbl_withdraw(u32 type, u32 lower, u32 ref, u32 key)
 /**
  * tipc_nametbl_subscribe - add a subscription object to the name table
  */
-void tipc_nametbl_subscribe(struct tipc_subscription *s)
+void tipc_nametbl_subscribe(struct tipc_subscription *s, bool status)
 {
-	u32 type = s->seq.type;
+	struct tipc_net *tn = net_generic(s->net, tipc_net_id);
+	u32 type = tipc_subscrp_convert_seq_type(s->evt.s.seq.type, s->swap);
 	int index = hash(type);
 	struct name_seq *seq;
+	struct tipc_name_seq ns;
 
-	spin_lock_bh(&tipc_nametbl_lock);
-	seq = nametbl_find_seq(type);
+	spin_lock_bh(&tn->nametbl_lock);
+	seq = nametbl_find_seq(s->net, type);
 	if (!seq)
-		seq = tipc_nameseq_create(type,
-					  &tipc_nametbl->seq_hlist[index]);
+		seq = tipc_nameseq_create(type, &tn->nametbl->seq_hlist[index]);
 	if (seq) {
 		spin_lock_bh(&seq->lock);
-		tipc_nameseq_subscribe(seq, s);
+		tipc_nameseq_subscribe(seq, s, status);
 		spin_unlock_bh(&seq->lock);
 	} else {
+		tipc_subscrp_convert_seq(&s->evt.s.seq, s->swap, &ns);
 		pr_warn("Failed to create subscription for {%u,%u,%u}\n",
-			s->seq.type, s->seq.lower, s->seq.upper);
+			ns.type, ns.lower, ns.upper);
 	}
-	spin_unlock_bh(&tipc_nametbl_lock);
+	spin_unlock_bh(&tn->nametbl_lock);
 }
 
 /**
@@ -740,13 +837,16 @@ void tipc_nametbl_subscribe(struct tipc_subscription *s)
  */
 void tipc_nametbl_unsubscribe(struct tipc_subscription *s)
 {
+	struct tipc_net *tn = net_generic(s->net, tipc_net_id);
 	struct name_seq *seq;
+	u32 type = tipc_subscrp_convert_seq_type(s->evt.s.seq.type, s->swap);
 
-	spin_lock_bh(&tipc_nametbl_lock);
-	seq = nametbl_find_seq(s->seq.type);
+	spin_lock_bh(&tn->nametbl_lock);
+	seq = nametbl_find_seq(s->net, type);
 	if (seq != NULL) {
 		spin_lock_bh(&seq->lock);
 		list_del_init(&s->nameseq_list);
+		tipc_subscrp_put(s);
 		if (!seq->first_free && list_empty(&seq->subscriptions)) {
 			hlist_del_init_rcu(&seq->ns_list);
 			kfree(seq->sseqs);
@@ -756,193 +856,13 @@ void tipc_nametbl_unsubscribe(struct tipc_subscription *s)
 			spin_unlock_bh(&seq->lock);
 		}
 	}
-	spin_unlock_bh(&tipc_nametbl_lock);
+	spin_unlock_bh(&tn->nametbl_lock);
 }
 
-/**
- * subseq_list - print specified sub-sequence contents into the given buffer
- */
-static int subseq_list(struct sub_seq *sseq, char *buf, int len, u32 depth,
-		       u32 index)
+int tipc_nametbl_init(struct net *net)
 {
-	char portIdStr[27];
-	const char *scope_str[] = {"", " zone", " cluster", " node"};
-	struct publication *publ;
-	struct name_info *info;
-	int ret;
-
-	ret = tipc_snprintf(buf, len, "%-10u %-10u ", sseq->lower, sseq->upper);
-
-	if (depth == 2) {
-		ret += tipc_snprintf(buf - ret, len + ret, "\n");
-		return ret;
-	}
-
-	info = sseq->info;
-
-	list_for_each_entry(publ, &info->zone_list, zone_list) {
-		sprintf(portIdStr, "<%u.%u.%u:%u>",
-			 tipc_zone(publ->node), tipc_cluster(publ->node),
-			 tipc_node(publ->node), publ->ref);
-		ret += tipc_snprintf(buf + ret, len - ret, "%-26s ", portIdStr);
-		if (depth > 3) {
-			ret += tipc_snprintf(buf + ret, len - ret, "%-10u %s",
-					     publ->key, scope_str[publ->scope]);
-		}
-		if (!list_is_last(&publ->zone_list, &info->zone_list))
-			ret += tipc_snprintf(buf + ret, len - ret,
-					     "\n%33s", " ");
-	}
-
-	ret += tipc_snprintf(buf + ret, len - ret, "\n");
-	return ret;
-}
-
-/**
- * nameseq_list - print specified name sequence contents into the given buffer
- */
-static int nameseq_list(struct name_seq *seq, char *buf, int len, u32 depth,
-			u32 type, u32 lowbound, u32 upbound, u32 index)
-{
-	struct sub_seq *sseq;
-	char typearea[11];
-	int ret = 0;
-
-	if (seq->first_free == 0)
-		return 0;
-
-	sprintf(typearea, "%-10u", seq->type);
-
-	if (depth == 1) {
-		ret += tipc_snprintf(buf, len, "%s\n", typearea);
-		return ret;
-	}
-
-	for (sseq = seq->sseqs; sseq != &seq->sseqs[seq->first_free]; sseq++) {
-		if ((lowbound <= sseq->upper) && (upbound >= sseq->lower)) {
-			ret += tipc_snprintf(buf + ret, len - ret, "%s ",
-					    typearea);
-			spin_lock_bh(&seq->lock);
-			ret += subseq_list(sseq, buf + ret, len - ret,
-					  depth, index);
-			spin_unlock_bh(&seq->lock);
-			sprintf(typearea, "%10s", " ");
-		}
-	}
-	return ret;
-}
-
-/**
- * nametbl_header - print name table header into the given buffer
- */
-static int nametbl_header(char *buf, int len, u32 depth)
-{
-	const char *header[] = {
-		"Type       ",
-		"Lower      Upper      ",
-		"Port Identity              ",
-		"Publication Scope"
-	};
-
-	int i;
-	int ret = 0;
-
-	if (depth > 4)
-		depth = 4;
-	for (i = 0; i < depth; i++)
-		ret += tipc_snprintf(buf + ret, len - ret, header[i]);
-	ret += tipc_snprintf(buf + ret, len - ret, "\n");
-	return ret;
-}
-
-/**
- * nametbl_list - print specified name table contents into the given buffer
- */
-static int nametbl_list(char *buf, int len, u32 depth_info,
-			u32 type, u32 lowbound, u32 upbound)
-{
-	struct hlist_head *seq_head;
-	struct name_seq *seq;
-	int all_types;
-	int ret = 0;
-	u32 depth;
-	u32 i;
-
-	all_types = (depth_info & TIPC_NTQ_ALLTYPES);
-	depth = (depth_info & ~TIPC_NTQ_ALLTYPES);
-
-	if (depth == 0)
-		return 0;
-
-	if (all_types) {
-		/* display all entries in name table to specified depth */
-		ret += nametbl_header(buf, len, depth);
-		lowbound = 0;
-		upbound = ~0;
-		for (i = 0; i < TIPC_NAMETBL_SIZE; i++) {
-			seq_head = &tipc_nametbl->seq_hlist[i];
-			hlist_for_each_entry_rcu(seq, seq_head, ns_list) {
-				ret += nameseq_list(seq, buf + ret, len - ret,
-						   depth, seq->type,
-						   lowbound, upbound, i);
-			}
-		}
-	} else {
-		/* display only the sequence that matches the specified type */
-		if (upbound < lowbound) {
-			ret += tipc_snprintf(buf + ret, len - ret,
-					"invalid name sequence specified\n");
-			return ret;
-		}
-		ret += nametbl_header(buf + ret, len - ret, depth);
-		i = hash(type);
-		seq_head = &tipc_nametbl->seq_hlist[i];
-		hlist_for_each_entry_rcu(seq, seq_head, ns_list) {
-			if (seq->type == type) {
-				ret += nameseq_list(seq, buf + ret, len - ret,
-						   depth, type,
-						   lowbound, upbound, i);
-				break;
-			}
-		}
-	}
-	return ret;
-}
-
-struct sk_buff *tipc_nametbl_get(const void *req_tlv_area, int req_tlv_space)
-{
-	struct sk_buff *buf;
-	struct tipc_name_table_query *argv;
-	struct tlv_desc *rep_tlv;
-	char *pb;
-	int pb_len;
-	int str_len;
-
-	if (!TLV_CHECK(req_tlv_area, req_tlv_space, TIPC_TLV_NAME_TBL_QUERY))
-		return tipc_cfg_reply_error_string(TIPC_CFG_TLV_ERROR);
-
-	buf = tipc_cfg_reply_alloc(TLV_SPACE(ULTRA_STRING_MAX_LEN));
-	if (!buf)
-		return NULL;
-
-	rep_tlv = (struct tlv_desc *)buf->data;
-	pb = TLV_DATA(rep_tlv);
-	pb_len = ULTRA_STRING_MAX_LEN;
-	argv = (struct tipc_name_table_query *)TLV_DATA(req_tlv_area);
-	rcu_read_lock();
-	str_len = nametbl_list(pb, pb_len, ntohl(argv->depth),
-			       ntohl(argv->type),
-			       ntohl(argv->lowbound), ntohl(argv->upbound));
-	rcu_read_unlock();
-	str_len += 1;	/* for "\0" */
-	skb_put(buf, TLV_SPACE(str_len));
-	TLV_SET(rep_tlv, TIPC_TLV_ULTRA_STRING, NULL, str_len);
-
-	return buf;
-}
-
-int tipc_nametbl_init(void)
-{
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
+	struct name_table *tipc_nametbl;
 	int i;
 
 	tipc_nametbl = kzalloc(sizeof(*tipc_nametbl), GFP_ATOMIC);
@@ -955,6 +875,8 @@ int tipc_nametbl_init(void)
 	INIT_LIST_HEAD(&tipc_nametbl->publ_list[TIPC_ZONE_SCOPE]);
 	INIT_LIST_HEAD(&tipc_nametbl->publ_list[TIPC_CLUSTER_SCOPE]);
 	INIT_LIST_HEAD(&tipc_nametbl->publ_list[TIPC_NODE_SCOPE]);
+	tn->nametbl = tipc_nametbl;
+	spin_lock_init(&tn->nametbl_lock);
 	return 0;
 }
 
@@ -963,7 +885,7 @@ int tipc_nametbl_init(void)
  *
  * tipc_nametbl_lock must be held when calling this function
  */
-static void tipc_purge_publications(struct name_seq *seq)
+static void tipc_purge_publications(struct net *net, struct name_seq *seq)
 {
 	struct publication *publ, *safe;
 	struct sub_seq *sseq;
@@ -973,7 +895,7 @@ static void tipc_purge_publications(struct name_seq *seq)
 	sseq = seq->sseqs;
 	info = sseq->info;
 	list_for_each_entry_safe(publ, safe, &info->zone_list, zone_list) {
-		tipc_nametbl_remove_publ(publ->type, publ->lower, publ->node,
+		tipc_nameseq_remove_publ(net, seq, publ->lower, publ->node,
 					 publ->ref, publ->key);
 		kfree_rcu(publ, rcu);
 	}
@@ -984,25 +906,27 @@ static void tipc_purge_publications(struct name_seq *seq)
 	kfree_rcu(seq, rcu);
 }
 
-void tipc_nametbl_stop(void)
+void tipc_nametbl_stop(struct net *net)
 {
 	u32 i;
 	struct name_seq *seq;
 	struct hlist_head *seq_head;
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
+	struct name_table *tipc_nametbl = tn->nametbl;
 
 	/* Verify name table is empty and purge any lingering
 	 * publications, then release the name table
 	 */
-	spin_lock_bh(&tipc_nametbl_lock);
+	spin_lock_bh(&tn->nametbl_lock);
 	for (i = 0; i < TIPC_NAMETBL_SIZE; i++) {
 		if (hlist_empty(&tipc_nametbl->seq_hlist[i]))
 			continue;
 		seq_head = &tipc_nametbl->seq_hlist[i];
 		hlist_for_each_entry_rcu(seq, seq_head, ns_list) {
-			tipc_purge_publications(seq);
+			tipc_purge_publications(net, seq);
 		}
 	}
-	spin_unlock_bh(&tipc_nametbl_lock);
+	spin_unlock_bh(&tn->nametbl_lock);
 
 	synchronize_net();
 	kfree(tipc_nametbl);
@@ -1033,7 +957,7 @@ static int __tipc_nl_add_nametable_publ(struct tipc_nl_msg *msg,
 		*last_publ = p->key;
 
 		hdr = genlmsg_put(msg->skb, msg->portid, msg->seq,
-				  &tipc_genl_v2_family, NLM_F_MULTI,
+				  &tipc_genl_family, NLM_F_MULTI,
 				  TIPC_NL_NAME_TABLE_GET);
 		if (!hdr)
 			return -EMSGSIZE;
@@ -1106,9 +1030,10 @@ static int __tipc_nl_subseq_list(struct tipc_nl_msg *msg, struct name_seq *seq,
 	return 0;
 }
 
-static int __tipc_nl_seq_list(struct tipc_nl_msg *msg, u32 *last_type,
-			      u32 *last_lower, u32 *last_publ)
+static int tipc_nl_seq_list(struct net *net, struct tipc_nl_msg *msg,
+			    u32 *last_type, u32 *last_lower, u32 *last_publ)
 {
+	struct tipc_net *tn = net_generic(net, tipc_net_id);
 	struct hlist_head *seq_head;
 	struct name_seq *seq = NULL;
 	int err;
@@ -1120,10 +1045,10 @@ static int __tipc_nl_seq_list(struct tipc_nl_msg *msg, u32 *last_type,
 		i = 0;
 
 	for (; i < TIPC_NAMETBL_SIZE; i++) {
-		seq_head = &tipc_nametbl->seq_hlist[i];
+		seq_head = &tn->nametbl->seq_hlist[i];
 
 		if (*last_type) {
-			seq = nametbl_find_seq(*last_type);
+			seq = nametbl_find_seq(net, *last_type);
 			if (!seq)
 				return -EPIPE;
 		} else {
@@ -1157,6 +1082,7 @@ int tipc_nl_name_table_dump(struct sk_buff *skb, struct netlink_callback *cb)
 	u32 last_type = cb->args[0];
 	u32 last_lower = cb->args[1];
 	u32 last_publ = cb->args[2];
+	struct net *net = sock_net(skb->sk);
 	struct tipc_nl_msg msg;
 
 	if (done)
@@ -1167,7 +1093,7 @@ int tipc_nl_name_table_dump(struct sk_buff *skb, struct netlink_callback *cb)
 	msg.seq = cb->nlh->nlmsg_seq;
 
 	rcu_read_lock();
-	err = __tipc_nl_seq_list(&msg, &last_type, &last_lower, &last_publ);
+	err = tipc_nl_seq_list(net, &msg, &last_type, &last_lower, &last_publ);
 	if (!err) {
 		done = 1;
 	} else if (err != -EMSGSIZE) {
@@ -1187,4 +1113,82 @@ int tipc_nl_name_table_dump(struct sk_buff *skb, struct netlink_callback *cb)
 	cb->args[3] = done;
 
 	return skb->len;
+}
+
+struct tipc_dest *tipc_dest_find(struct list_head *l, u32 node, u32 port)
+{
+	u64 value = (u64)node << 32 | port;
+	struct tipc_dest *dst;
+
+	list_for_each_entry(dst, l, list) {
+		if (dst->value != value)
+			continue;
+		return dst;
+	}
+	return NULL;
+}
+
+bool tipc_dest_push(struct list_head *l, u32 node, u32 port)
+{
+	u64 value = (u64)node << 32 | port;
+	struct tipc_dest *dst;
+
+	if (tipc_dest_find(l, node, port))
+		return false;
+
+	dst = kmalloc(sizeof(*dst), GFP_ATOMIC);
+	if (unlikely(!dst))
+		return false;
+	dst->value = value;
+	list_add(&dst->list, l);
+	return true;
+}
+
+bool tipc_dest_pop(struct list_head *l, u32 *node, u32 *port)
+{
+	struct tipc_dest *dst;
+
+	if (list_empty(l))
+		return false;
+	dst = list_first_entry(l, typeof(*dst), list);
+	if (port)
+		*port = dst->port;
+	if (node)
+		*node = dst->node;
+	list_del(&dst->list);
+	kfree(dst);
+	return true;
+}
+
+bool tipc_dest_del(struct list_head *l, u32 node, u32 port)
+{
+	struct tipc_dest *dst;
+
+	dst = tipc_dest_find(l, node, port);
+	if (!dst)
+		return false;
+	list_del(&dst->list);
+	kfree(dst);
+	return true;
+}
+
+void tipc_dest_list_purge(struct list_head *l)
+{
+	struct tipc_dest *dst, *tmp;
+
+	list_for_each_entry_safe(dst, tmp, l, list) {
+		list_del(&dst->list);
+		kfree(dst);
+	}
+}
+
+int tipc_dest_list_len(struct list_head *l)
+{
+	struct tipc_dest *dst;
+	int i = 0;
+
+	list_for_each_entry(dst, l, list) {
+		i++;
+	}
+	return i;
 }

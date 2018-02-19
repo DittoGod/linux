@@ -1,9 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
 #
 # PCI Express Root Port Device AER Configuration
 #
 
 config PCIEAER
-	boolean "Root Port Advanced Error Reporting support"
+	bool "Root Port Advanced Error Reporting support"
 	depends on PCIEPORTBUS
 	select RAS
 	default y

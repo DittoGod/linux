@@ -105,6 +105,7 @@ do {									\
 static struct class * ch_sysfs_class;
 
 typedef struct {
+	struct kref         ref;
 	struct list_head    list;
 	int                 minor;
 	char                name[8];
@@ -194,16 +195,10 @@ ch_do_scsi(scsi_changer *ch, unsigned char *cmd, int cmd_len,
 
  retry:
 	errno = 0;
-	if (debug) {
-		DPRINTK("command: ");
-		__scsi_print_command(cmd, cmd_len);
-	}
-
 	result = scsi_execute_req(ch->device, cmd, direction, buffer,
 				  buflength, &sshdr, timeout * HZ,
 				  MAX_RETRIES, NULL);
 
-	DPRINTK("result: 0x%x\n",result);
 	if (driver_byte(result) & DRIVER_SENSE) {
 		if (debug)
 			scsi_print_sense_hdr(ch->device, ch->name, &sshdr);
@@ -345,7 +340,7 @@ ch_readconfig(scsi_changer *ch)
 			ch->firsts[CHET_DT],
 			ch->counts[CHET_DT]);
 	} else {
-		VPRINTK(KERN_INFO, "reading element address assigment page failed!\n");
+		VPRINTK(KERN_INFO, "reading element address assignment page failed!\n");
 	}
 
 	/* vendor specific element types */
@@ -569,13 +564,23 @@ static int ch_gstatus(scsi_changer *ch, int type, unsigned char __user *dest)
 
 /* ------------------------------------------------------------------------ */
 
+static void ch_destroy(struct kref *ref)
+{
+	scsi_changer *ch = container_of(ref, scsi_changer, ref);
+
+	kfree(ch->dt);
+	kfree(ch);
+}
+
 static int
 ch_release(struct inode *inode, struct file *file)
 {
 	scsi_changer *ch = file->private_data;
 
 	scsi_device_put(ch->device);
+	ch->device = NULL;
 	file->private_data = NULL;
+	kref_put(&ch->ref, ch_destroy);
 	return 0;
 }
 
@@ -594,6 +599,7 @@ ch_open(struct inode *inode, struct file *file)
 		mutex_unlock(&ch_mutex);
 		return -ENXIO;
 	}
+	kref_get(&ch->ref);
 	spin_unlock(&ch_index_lock);
 
 	file->private_data = ch;
@@ -941,8 +947,11 @@ static int ch_probe(struct device *dev)
 	}
 
 	mutex_init(&ch->lock);
+	kref_init(&ch->ref);
 	ch->device = sd;
-	ch_readconfig(ch);
+	ret = ch_readconfig(ch);
+	if (ret)
+		goto destroy_dev;
 	if (init)
 		ch_init_elem(ch);
 
@@ -950,6 +959,8 @@ static int ch_probe(struct device *dev)
 	sdev_printk(KERN_INFO, sd, "Attached scsi changer %s\n", ch->name);
 
 	return 0;
+destroy_dev:
+	device_destroy(ch_sysfs_class, MKDEV(SCSI_CHANGER_MAJOR, ch->minor));
 remove_idr:
 	idr_remove(&ch_index_idr, ch->minor);
 free_ch:
@@ -966,8 +977,7 @@ static int ch_remove(struct device *dev)
 	spin_unlock(&ch_index_lock);
 
 	device_destroy(ch_sysfs_class, MKDEV(SCSI_CHANGER_MAJOR,ch->minor));
-	kfree(ch->dt);
-	kfree(ch);
+	kref_put(&ch->ref, ch_destroy);
 	return 0;
 }
 

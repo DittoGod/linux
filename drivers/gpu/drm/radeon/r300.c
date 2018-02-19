@@ -50,6 +50,31 @@
  */
 
 /*
+ * Indirect registers accessor
+ */
+uint32_t rv370_pcie_rreg(struct radeon_device *rdev, uint32_t reg)
+{
+	unsigned long flags;
+	uint32_t r;
+
+	spin_lock_irqsave(&rdev->pcie_idx_lock, flags);
+	WREG32(RADEON_PCIE_INDEX, ((reg) & rdev->pcie_reg_mask));
+	r = RREG32(RADEON_PCIE_DATA);
+	spin_unlock_irqrestore(&rdev->pcie_idx_lock, flags);
+	return r;
+}
+
+void rv370_pcie_wreg(struct radeon_device *rdev, uint32_t reg, uint32_t v)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&rdev->pcie_idx_lock, flags);
+	WREG32(RADEON_PCIE_INDEX, ((reg) & rdev->pcie_reg_mask));
+	WREG32(RADEON_PCIE_DATA, (v));
+	spin_unlock_irqrestore(&rdev->pcie_idx_lock, flags);
+}
+
+/*
  * rv370,rv380 PCIE GART
  */
 static int rv370_debugfs_pcie_gart_info_init(struct radeon_device *rdev);
@@ -73,11 +98,8 @@ void rv370_pcie_gart_tlb_flush(struct radeon_device *rdev)
 #define R300_PTE_WRITEABLE (1 << 2)
 #define R300_PTE_READABLE  (1 << 3)
 
-void rv370_pcie_gart_set_page(struct radeon_device *rdev, unsigned i,
-			      uint64_t addr, uint32_t flags)
+uint64_t rv370_pcie_gart_get_page_entry(uint64_t addr, uint32_t flags)
 {
-	void __iomem *ptr = rdev->gart.ptr;
-
 	addr = (lower_32_bits(addr) >> 8) |
 		((upper_32_bits(addr) & 0xff) << 24);
 	if (flags & RADEON_GART_PAGE_READ)
@@ -86,10 +108,18 @@ void rv370_pcie_gart_set_page(struct radeon_device *rdev, unsigned i,
 		addr |= R300_PTE_WRITEABLE;
 	if (!(flags & RADEON_GART_PAGE_SNOOP))
 		addr |= R300_PTE_UNSNOOPED;
+	return addr;
+}
+
+void rv370_pcie_gart_set_page(struct radeon_device *rdev, unsigned i,
+			      uint64_t entry)
+{
+	void __iomem *ptr = rdev->gart.ptr;
+
 	/* on x86 we want this to be CPU endian, on powerpc
 	 * on powerpc without HW swappers, it'll get swapped on way
 	 * into VRAM - so no need for cpu_to_le32 on VRAM tables */
-	writel(addr, ((void __iomem *)ptr) + (i * 4));
+	writel(entry, ((void __iomem *)ptr) + (i * 4));
 }
 
 int rv370_pcie_gart_init(struct radeon_device *rdev)
@@ -109,6 +139,7 @@ int rv370_pcie_gart_init(struct radeon_device *rdev)
 		DRM_ERROR("Failed to register debugfs file for PCIE gart !\n");
 	rdev->gart.table_size = rdev->gart.num_gpu_pages * 4;
 	rdev->asic->gart.tlb_flush = &rv370_pcie_gart_tlb_flush;
+	rdev->asic->gart.get_page_entry = &rv370_pcie_gart_get_page_entry;
 	rdev->asic->gart.set_page = &rv370_pcie_gart_set_page;
 	return radeon_gart_table_vram_alloc(rdev);
 }
@@ -356,8 +387,7 @@ static void r300_gpu_init(struct radeon_device *rdev)
 	WREG32(R300_GB_TILE_CONFIG, gb_tile_config);
 
 	if (r100_gui_wait_for_idle(rdev)) {
-		printk(KERN_WARNING "Failed to wait GUI idle while "
-		       "programming pipes. Bad things might happen.\n");
+		pr_warn("Failed to wait GUI idle while programming pipes. Bad things might happen.\n");
 	}
 
 	tmp = RREG32(R300_DST_PIPE_CONFIG);
@@ -368,18 +398,16 @@ static void r300_gpu_init(struct radeon_device *rdev)
 	       R300_DC_DC_DISABLE_IGNORE_PE);
 
 	if (r100_gui_wait_for_idle(rdev)) {
-		printk(KERN_WARNING "Failed to wait GUI idle while "
-		       "programming pipes. Bad things might happen.\n");
+		pr_warn("Failed to wait GUI idle while programming pipes. Bad things might happen.\n");
 	}
 	if (r300_mc_wait_for_idle(rdev)) {
-		printk(KERN_WARNING "Failed to wait MC idle while "
-		       "programming pipes. Bad things might happen.\n");
+		pr_warn("Failed to wait MC idle while programming pipes. Bad things might happen.\n");
 	}
-	DRM_INFO("radeon: %d quad pipes, %d Z pipes initialized.\n",
+	DRM_INFO("radeon: %d quad pipes, %d Z pipes initialized\n",
 		 rdev->num_gb_pipes, rdev->num_z_pipes);
 }
 
-int r300_asic_reset(struct radeon_device *rdev)
+int r300_asic_reset(struct radeon_device *rdev, bool hard)
 {
 	struct r100_mc_save save;
 	u32 status, tmp;
@@ -1134,7 +1162,7 @@ static int r300_packet0_check(struct radeon_cs_parser *p,
 	}
 	return 0;
 fail:
-	printk(KERN_ERR "Forbidden register 0x%04X in cs at %d (val=%08x)\n",
+	pr_err("Forbidden register 0x%04X in cs at %d (val=%08x)\n",
 	       reg, idx, idx_value);
 	return -EINVAL;
 }

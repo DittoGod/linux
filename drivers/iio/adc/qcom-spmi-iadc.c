@@ -296,7 +296,8 @@ static int iadc_do_conversion(struct iadc_chip *iadc, int chan, u16 *data)
 	if (iadc->poll_eoc) {
 		ret = iadc_poll_wait_eoc(iadc, wait);
 	} else {
-		ret = wait_for_completion_timeout(&iadc->complete, wait);
+		ret = wait_for_completion_timeout(&iadc->complete,
+			usecs_to_jiffies(wait));
 		if (!ret)
 			ret = -ETIMEDOUT;
 		else
@@ -355,7 +356,6 @@ static int iadc_read_raw(struct iio_dev *indio_dev,
 
 static const struct iio_info iadc_info = {
 	.read_raw = iadc_read_raw,
-	.driver_module = THIS_MODULE,
 };
 
 static irqreturn_t iadc_isr(int irq, void *dev_id)

@@ -33,7 +33,7 @@
 #include <linux/time.h>
 #include "kfd_priv.h"
 #include <linux/mm.h>
-#include <uapi/asm-generic/mman-common.h>
+#include <linux/mman.h>
 #include <asm/processor.h>
 
 /*
@@ -300,13 +300,19 @@ int kfd_init_apertures(struct kfd_process *process)
 	struct kfd_process_device *pdd;
 
 	/*Iterating over all devices*/
-	while ((dev = kfd_topology_enum_kfd_devices(id)) != NULL &&
+	while (kfd_topology_enum_kfd_devices(id, &dev) == 0 &&
 		id < NUM_OF_SUPPORTED_GPUS) {
 
-		pdd = kfd_get_process_device_data(dev, process, 1);
-		if (!pdd)
-			return -1;
+		if (!dev) {
+			id++; /* Skip non GPU devices */
+			continue;
+		}
 
+		pdd = kfd_create_process_device_data(dev, process);
+		if (!pdd) {
+			pr_err("Failed to create process device data\n");
+			return -1;
+		}
 		/*
 		 * For 64 bit process aperture will be statically reserved in
 		 * the x86_64 non canonical process address space

@@ -540,9 +540,8 @@ static void snd_card_asihpi_pcm_timer_start(struct snd_pcm_substream *
 	expiry = HZ / 200;
 
 	expiry = max(expiry, 1); /* don't let it be zero! */
-	dpcm->timer.expires = jiffies + expiry;
+	mod_timer(&dpcm->timer, jiffies + expiry);
 	dpcm->respawn_timer = 1;
-	add_timer(&dpcm->timer);
 }
 
 static void snd_card_asihpi_pcm_timer_stop(struct snd_pcm_substream *substream)
@@ -559,12 +558,10 @@ static void snd_card_asihpi_pcm_int_start(struct snd_pcm_substream *substream)
 	struct snd_card_asihpi_pcm *dpcm;
 	struct snd_card_asihpi *card;
 
-	BUG_ON(!substream);
-
 	dpcm = (struct snd_card_asihpi_pcm *)substream->runtime->private_data;
 	card = snd_pcm_substream_chip(substream);
 
-	BUG_ON(in_interrupt());
+	WARN_ON(in_interrupt());
 	tasklet_disable(&card->t);
 	card->llmode_streampriv = dpcm;
 	tasklet_enable(&card->t);
@@ -576,12 +573,8 @@ static void snd_card_asihpi_pcm_int_start(struct snd_pcm_substream *substream)
 
 static void snd_card_asihpi_pcm_int_stop(struct snd_pcm_substream *substream)
 {
-	struct snd_card_asihpi_pcm *dpcm;
 	struct snd_card_asihpi *card;
 
-	BUG_ON(!substream);
-
-	dpcm = (struct snd_card_asihpi_pcm *)substream->runtime->private_data;
 	card = snd_pcm_substream_chip(substream);
 
 	hpi_handle_error(hpi_adapter_set_property(card->hpi->adapter->index,
@@ -754,9 +747,9 @@ static inline unsigned int modulo_min(unsigned int a, unsigned int b,
 
 /** Timer function, equivalent to interrupt service routine for cards
 */
-static void snd_card_asihpi_timer_function(unsigned long data)
+static void snd_card_asihpi_timer_function(struct timer_list *t)
 {
-	struct snd_card_asihpi_pcm *dpcm = (struct snd_card_asihpi_pcm *)data;
+	struct snd_card_asihpi_pcm *dpcm = from_timer(dpcm, t, timer);
 	struct snd_pcm_substream *substream = dpcm->substream;
 	struct snd_card_asihpi *card = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime;
@@ -868,7 +861,6 @@ static void snd_card_asihpi_timer_function(unsigned long data)
 
 	snd_pcm_group_for_each_entry(s, substream) {
 		struct snd_card_asihpi_pcm *ds = s->runtime->private_data;
-		runtime = s->runtime;
 
 		/* don't link Cap and Play */
 		if (substream->stream != s->stream)
@@ -953,7 +945,7 @@ static void snd_card_asihpi_int_task(unsigned long data)
 	asihpi = (struct snd_card_asihpi *)a->snd_card->private_data;
 	if (asihpi->llmode_streampriv)
 		snd_card_asihpi_timer_function(
-			(unsigned long)asihpi->llmode_streampriv);
+			&asihpi->llmode_streampriv->timer);
 }
 
 static void snd_card_asihpi_isr(struct hpi_adapter *a)
@@ -1064,9 +1056,7 @@ static int snd_card_asihpi_playback_open(struct snd_pcm_substream *substream)
 	    If internal and other stream playing, can't switch
 	*/
 
-	init_timer(&dpcm->timer);
-	dpcm->timer.data = (unsigned long) dpcm;
-	dpcm->timer.function = snd_card_asihpi_timer_function;
+	timer_setup(&dpcm->timer, snd_card_asihpi_timer_function, 0);
 	dpcm->substream = substream;
 	runtime->private_data = dpcm;
 	runtime->private_free = snd_card_asihpi_runtime_free;
@@ -1140,7 +1130,7 @@ static int snd_card_asihpi_playback_close(struct snd_pcm_substream *substream)
 	return 0;
 }
 
-static struct snd_pcm_ops snd_card_asihpi_playback_mmap_ops = {
+static const struct snd_pcm_ops snd_card_asihpi_playback_mmap_ops = {
 	.open = snd_card_asihpi_playback_open,
 	.close = snd_card_asihpi_playback_close,
 	.ioctl = snd_card_asihpi_playback_ioctl,
@@ -1246,9 +1236,7 @@ static int snd_card_asihpi_capture_open(struct snd_pcm_substream *substream)
 	if (err)
 		return -EIO;
 
-	init_timer(&dpcm->timer);
-	dpcm->timer.data = (unsigned long) dpcm;
-	dpcm->timer.function = snd_card_asihpi_timer_function;
+	timer_setup(&dpcm->timer, snd_card_asihpi_timer_function, 0);
 	dpcm->substream = substream;
 	runtime->private_data = dpcm;
 	runtime->private_free = snd_card_asihpi_runtime_free;
@@ -1308,7 +1296,7 @@ static int snd_card_asihpi_capture_close(struct snd_pcm_substream *substream)
 	return 0;
 }
 
-static struct snd_pcm_ops snd_card_asihpi_capture_mmap_ops = {
+static const struct snd_pcm_ops snd_card_asihpi_capture_mmap_ops = {
 	.open = snd_card_asihpi_capture_open,
 	.close = snd_card_asihpi_capture_close,
 	.ioctl = snd_card_asihpi_capture_ioctl,
@@ -2379,7 +2367,7 @@ static int snd_asihpi_cmode_add(struct snd_card_asihpi *asihpi,
 /*------------------------------------------------------------
    Sampleclock source  controls
  ------------------------------------------------------------*/
-static const char const *sampleclock_sources[] = {
+static const char * const sampleclock_sources[] = {
 	"N/A", "Local PLL", "Digital Sync", "Word External", "Word Header",
 	"SMPTE", "Digital1", "Auto", "Network", "Invalid",
 	"Prev Module", "BLU-Link",
@@ -2832,14 +2820,11 @@ static int snd_asihpi_hpi_ioctl(struct snd_hwdep *hw, struct file *file,
 /* results in /dev/snd/hwC#D0 file for each card with index #
    also /proc/asound/hwdep will contain '#-00: asihpi (HPI) for each card'
 */
-static int snd_asihpi_hpi_new(struct snd_card_asihpi *asihpi,
-			      int device, struct snd_hwdep **rhwdep)
+static int snd_asihpi_hpi_new(struct snd_card_asihpi *asihpi, int device)
 {
 	struct snd_hwdep *hw;
 	int err;
 
-	if (rhwdep)
-		*rhwdep = NULL;
 	err = snd_hwdep_new(asihpi->card, "HPI", device, &hw);
 	if (err < 0)
 		return err;
@@ -2849,8 +2834,6 @@ static int snd_asihpi_hpi_new(struct snd_card_asihpi *asihpi,
 	hw->ops.ioctl = snd_asihpi_hpi_ioctl;
 	hw->ops.release = snd_asihpi_hpi_release;
 	hw->private_data = asihpi;
-	if (rhwdep)
-		*rhwdep = hw;
 	return 0;
 }
 
@@ -2993,7 +2976,7 @@ static int snd_asihpi_probe(struct pci_dev *pci_dev,
 
 	/* always create, can be enabled or disabled dynamically
 	    by enable_hwdep  module param*/
-	snd_asihpi_hpi_new(asihpi, 0, NULL);
+	snd_asihpi_hpi_new(asihpi, 0);
 
 	strcpy(card->driver, "ASIHPI");
 

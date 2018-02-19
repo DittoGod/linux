@@ -18,6 +18,7 @@
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  */
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <dlfcn.h>
@@ -49,6 +50,52 @@ struct plugin_list {
 	void			*handle;
 };
 
+static void lower_case(char *str)
+{
+	if (!str)
+		return;
+	for (; *str; str++)
+		*str = tolower(*str);
+}
+
+static int update_option_value(struct pevent_plugin_option *op, const char *val)
+{
+	char *op_val;
+
+	if (!val) {
+		/* toggle, only if option is boolean */
+		if (op->value)
+			/* Warn? */
+			return 0;
+		op->set ^= 1;
+		return 0;
+	}
+
+	/*
+	 * If the option has a value then it takes a string
+	 * otherwise the option is a boolean.
+	 */
+	if (op->value) {
+		op->value = val;
+		return 0;
+	}
+
+	/* Option is boolean, must be either "1", "0", "true" or "false" */
+
+	op_val = strdup(val);
+	if (!op_val)
+		return -1;
+	lower_case(op_val);
+
+	if (strcmp(val, "1") == 0 || strcmp(val, "true") == 0)
+		op->set = 1;
+	else if (strcmp(val, "0") == 0 || strcmp(val, "false") == 0)
+		op->set = 0;
+	free(op_val);
+
+	return 0;
+}
+
 /**
  * traceevent_plugin_list_options - get list of plugin options
  *
@@ -73,12 +120,12 @@ char **traceevent_plugin_list_options(void)
 		for (op = reg->options; op->name; op++) {
 			char *alias = op->plugin_alias ? op->plugin_alias : op->file;
 			char **temp = list;
+			int ret;
 
-			name = malloc(strlen(op->name) + strlen(alias) + 2);
-			if (!name)
+			ret = asprintf(&name, "%s:%s", alias, op->name);
+			if (ret < 0)
 				goto err;
 
-			sprintf(name, "%s:%s", alias, op->name);
 			list = realloc(list, count + 2);
 			if (!list) {
 				list = temp;
@@ -120,6 +167,7 @@ update_option(const char *file, struct pevent_plugin_option *option)
 {
 	struct trace_plugin_options *op;
 	char *plugin;
+	int ret = 0;
 
 	if (option->plugin_alias) {
 		plugin = strdup(option->plugin_alias);
@@ -144,9 +192,10 @@ update_option(const char *file, struct pevent_plugin_option *option)
 		if (strcmp(op->option, option->name) != 0)
 			continue;
 
-		option->value = op->value;
-		option->set ^= 1;
-		goto out;
+		ret = update_option_value(option, op->value);
+		if (ret)
+			goto out;
+		break;
 	}
 
 	/* first look for unnamed options */
@@ -156,14 +205,13 @@ update_option(const char *file, struct pevent_plugin_option *option)
 		if (strcmp(op->option, option->name) != 0)
 			continue;
 
-		option->value = op->value;
-		option->set ^= 1;
+		ret = update_option_value(option, op->value);
 		break;
 	}
 
  out:
 	free(plugin);
-	return 0;
+	return ret;
 }
 
 /**
@@ -242,16 +290,13 @@ load_plugin(struct pevent *pevent, const char *path,
 	const char *alias;
 	char *plugin;
 	void *handle;
+	int ret;
 
-	plugin = malloc(strlen(path) + strlen(file) + 2);
-	if (!plugin) {
+	ret = asprintf(&plugin, "%s/%s", path, file);
+	if (ret < 0) {
 		warning("could not allocate plugin memory\n");
 		return;
 	}
-
-	strcpy(plugin, path);
-	strcat(plugin, "/");
-	strcat(plugin, file);
 
 	handle = dlopen(plugin, RTLD_NOW | RTLD_GLOBAL);
 	if (!handle) {
@@ -343,6 +388,7 @@ load_plugins(struct pevent *pevent, const char *suffix,
 	char *home;
 	char *path;
 	char *envdir;
+	int ret;
 
 	if (pevent->flags & PEVENT_DISABLE_PLUGINS)
 		return;
@@ -373,15 +419,11 @@ load_plugins(struct pevent *pevent, const char *suffix,
 	if (!home)
 		return;
 
-	path = malloc(strlen(home) + strlen(LOCAL_PLUGIN_DIR) + 2);
-	if (!path) {
+	ret = asprintf(&path, "%s/%s", home, LOCAL_PLUGIN_DIR);
+	if (ret < 0) {
 		warning("could not allocate plugin memory\n");
 		return;
 	}
-
-	strcpy(path, home);
-	strcat(path, "/");
-	strcat(path, LOCAL_PLUGIN_DIR);
 
 	load_plugins_dir(pevent, suffix, path, load_plugin, data);
 

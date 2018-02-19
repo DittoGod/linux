@@ -16,21 +16,19 @@
 #include <linux/thermal.h>
 #include "acpi_thermal_rel.h"
 
+#define INT3400_THERMAL_TABLE_CHANGED 0x83
+
 enum int3400_thermal_uuid {
 	INT3400_THERMAL_PASSIVE_1,
-	INT3400_THERMAL_PASSIVE_2,
 	INT3400_THERMAL_ACTIVE,
 	INT3400_THERMAL_CRITICAL,
-	INT3400_THERMAL_COOLING_MODE,
 	INT3400_THERMAL_MAXIMUM_UUID,
 };
 
-static u8 *int3400_thermal_uuids[INT3400_THERMAL_MAXIMUM_UUID] = {
+static char *int3400_thermal_uuids[INT3400_THERMAL_MAXIMUM_UUID] = {
 	"42A441D6-AE6A-462b-A84B-4A8CE79027D3",
-	"9E04115A-AE87-4D1C-9500-0F3E340BFE75",
 	"3A95C389-E4B8-4629-A526-C52C88626BAE",
 	"97C68AE7-15FA-499c-B8C9-5DA81D606E0A",
-	"16CAF1B7-DD38-40ed-B1C1-1B8A1913D531",
 };
 
 struct int3400_thermal_priv {
@@ -100,7 +98,7 @@ static ssize_t current_uuid_store(struct device *dev,
 	return -EINVAL;
 }
 
-static DEVICE_ATTR(current_uuid, 0644, current_uuid_show, current_uuid_store);
+static DEVICE_ATTR_RW(current_uuid);
 static DEVICE_ATTR_RO(available_uuids);
 static struct attribute *uuid_attrs[] = {
 	&dev_attr_available_uuids.attr,
@@ -108,7 +106,7 @@ static struct attribute *uuid_attrs[] = {
 	NULL
 };
 
-static struct attribute_group uuid_attribute_group = {
+static const struct attribute_group uuid_attribute_group = {
 	.attrs = uuid_attrs,
 	.name = "uuids"
 };
@@ -145,10 +143,10 @@ static int int3400_thermal_get_uuids(struct int3400_thermal_priv *priv)
 		}
 
 		for (j = 0; j < INT3400_THERMAL_MAXIMUM_UUID; j++) {
-			u8 uuid[16];
+			guid_t guid;
 
-			acpi_str_to_uuid(int3400_thermal_uuids[j], uuid);
-			if (!strncmp(uuid, objb->buffer.pointer, 16)) {
+			guid_parse(int3400_thermal_uuids[j], &guid);
+			if (guid_equal((guid_t *)objb->buffer.pointer, &guid)) {
 				priv->uuid_bitmap |= (1 << j);
 				break;
 			}
@@ -189,8 +187,37 @@ static int int3400_thermal_run_osc(acpi_handle handle,
 	return result;
 }
 
+static void int3400_notify(acpi_handle handle,
+			u32 event,
+			void *data)
+{
+	struct int3400_thermal_priv *priv = data;
+	char *thermal_prop[5];
+
+	if (!priv)
+		return;
+
+	switch (event) {
+	case INT3400_THERMAL_TABLE_CHANGED:
+		thermal_prop[0] = kasprintf(GFP_KERNEL, "NAME=%s",
+				priv->thermal->type);
+		thermal_prop[1] = kasprintf(GFP_KERNEL, "TEMP=%d",
+				priv->thermal->temperature);
+		thermal_prop[2] = kasprintf(GFP_KERNEL, "TRIP=");
+		thermal_prop[3] = kasprintf(GFP_KERNEL, "EVENT=%d",
+				THERMAL_TABLE_CHANGED);
+		thermal_prop[4] = NULL;
+		kobject_uevent_env(&priv->thermal->device.kobj, KOBJ_CHANGE,
+				thermal_prop);
+		break;
+	default:
+		/* Ignore unknown notification codes sent to INT3400 device */
+		break;
+	}
+}
+
 static int int3400_thermal_get_temp(struct thermal_zone_device *thermal,
-			unsigned long *temp)
+			int *temp)
 {
 	*temp = 20 * 1000; /* faked temp sensor with 20C */
 	return 0;
@@ -266,13 +293,12 @@ static int int3400_thermal_probe(struct platform_device *pdev)
 	result = acpi_parse_art(priv->adev->handle, &priv->art_count,
 				&priv->arts, true);
 	if (result)
-		goto free_priv;
-
+		dev_dbg(&pdev->dev, "_ART table parsing error\n");
 
 	result = acpi_parse_trt(priv->adev->handle, &priv->trt_count,
 				&priv->trts, true);
 	if (result)
-		goto free_art;
+		dev_dbg(&pdev->dev, "_TRT table parsing error\n");
 
 	platform_set_drvdata(pdev, priv);
 
@@ -285,7 +311,7 @@ static int int3400_thermal_probe(struct platform_device *pdev)
 						&int3400_thermal_params, 0, 0);
 	if (IS_ERR(priv->thermal)) {
 		result = PTR_ERR(priv->thermal);
-		goto free_trt;
+		goto free_art_trt;
 	}
 
 	priv->rel_misc_dev_res = acpi_thermal_rel_misc_device_add(
@@ -293,15 +319,24 @@ static int int3400_thermal_probe(struct platform_device *pdev)
 
 	result = sysfs_create_group(&pdev->dev.kobj, &uuid_attribute_group);
 	if (result)
-		goto free_zone;
+		goto free_rel_misc;
+
+	result = acpi_install_notify_handler(
+			priv->adev->handle, ACPI_DEVICE_NOTIFY, int3400_notify,
+			(void *)priv);
+	if (result)
+		goto free_sysfs;
 
 	return 0;
 
-free_zone:
+free_sysfs:
+	sysfs_remove_group(&pdev->dev.kobj, &uuid_attribute_group);
+free_rel_misc:
+	if (!priv->rel_misc_dev_res)
+		acpi_thermal_rel_misc_device_remove(priv->adev->handle);
 	thermal_zone_device_unregister(priv->thermal);
-free_trt:
+free_art_trt:
 	kfree(priv->trts);
-free_art:
 	kfree(priv->arts);
 free_priv:
 	kfree(priv);
@@ -311,6 +346,10 @@ free_priv:
 static int int3400_thermal_remove(struct platform_device *pdev)
 {
 	struct int3400_thermal_priv *priv = platform_get_drvdata(pdev);
+
+	acpi_remove_notify_handler(
+			priv->adev->handle, ACPI_DEVICE_NOTIFY,
+			int3400_notify);
 
 	if (!priv->rel_misc_dev_res)
 		acpi_thermal_rel_misc_device_remove(priv->adev->handle);

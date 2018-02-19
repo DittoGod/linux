@@ -1,5 +1,4 @@
 /*
- *
  * Copyright (C) 2011 Texas Instruments Incorporated - http://www.ti.com/
  * Author: Rob Clark <rob@ti.com>
  *         Andy Gross <andy.gross@ti.com>
@@ -106,6 +105,7 @@ uint32_t tiler_stride(enum tiler_fmt fmt, uint32_t orient);
 size_t tiler_size(enum tiler_fmt fmt, uint16_t w, uint16_t h);
 size_t tiler_vsize(enum tiler_fmt fmt, uint16_t w, uint16_t h);
 void tiler_align(enum tiler_fmt fmt, uint16_t *w, uint16_t *h);
+uint32_t tiler_get_cpu_cache_flags(void);
 bool dmm_is_available(void);
 
 extern struct platform_driver omap_dmm_driver;

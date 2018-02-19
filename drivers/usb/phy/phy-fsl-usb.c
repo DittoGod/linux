@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * Copyright (C) 2007,2008 Freescale semiconductor, Inc.
  *
@@ -5,20 +6,6 @@
  *         Jerry Huang <Chang-Ming.Huang@freescale.com>
  *
  * Initialization based on code from Shlomi Gridish.
- *
- * This program is free software; you can redistribute  it and/or modify it
- * under  the terms of  the GNU General  Public License as published by the
- * Free Software Foundation;  either version 2 of the  License, or (at your
- * option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the  GNU General Public License along
- * with this program; if not, write  to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
 #include <linux/module.h>
@@ -43,6 +30,13 @@
 #include <asm/unaligned.h>
 
 #include "phy-fsl-usb.h"
+
+#ifdef VERBOSE
+#define VDBG(fmt, args...) pr_debug("[%s]  " fmt, \
+				 __func__, ## args)
+#else
+#define VDBG(stuff...)	do {} while (0)
+#endif
 
 #define DRIVER_VERSION "Rev. 1.55"
 #define DRIVER_AUTHOR "Jerry Huang/Li Yang"
@@ -106,19 +100,6 @@ static void (*_fsl_writel)(u32 v, unsigned __iomem *p);
 #define fsl_readl(addr)		readl(addr)
 #define fsl_writel(val, addr)	writel(val, addr)
 #endif /* CONFIG_PPC32 */
-
-/* Routines to access transceiver ULPI registers */
-u8 view_ulpi(u8 addr)
-{
-	u32 temp;
-
-	temp = 0x40000000 | (addr << 16);
-	fsl_writel(temp, &usb_dr_regs->ulpiview);
-	udelay(1000);
-	while (temp & 0x40)
-		temp = fsl_readl(&usb_dr_regs->ulpiview);
-	return (le32_to_cpu(temp) & 0x0000ff00) >> 8;
-}
 
 int write_ulpi(u8 addr, u8 data)
 {
@@ -460,28 +441,6 @@ static void fsl_otg_fsm_del_timer(struct otg_fsm *fsm, enum otg_fsm_timer t)
 	fsl_otg_del_timer(fsm, timer);
 }
 
-/*
- * Reduce timer count by 1, and find timeout conditions.
- * Called by fsl_otg 1ms timer interrupt
- */
-int fsl_otg_tick_timer(void)
-{
-	struct fsl_otg_timer *tmp_timer, *del_tmp;
-	int expired = 0;
-
-	list_for_each_entry_safe(tmp_timer, del_tmp, &active_timers, list) {
-		tmp_timer->count--;
-		/* check if timer expires */
-		if (!tmp_timer->count) {
-			list_del(&tmp_timer->list);
-			tmp_timer->function(tmp_timer->data);
-			expired = 1;
-		}
-	}
-
-	return expired;
-}
-
 /* Reset controller, not reset the bus */
 void otg_reset_controller(void)
 {
@@ -677,17 +636,6 @@ static int fsl_otg_set_peripheral(struct usb_otg *otg,
 	return 0;
 }
 
-/* Set OTG port power, only for B-device */
-static int fsl_otg_set_power(struct usb_phy *phy, unsigned mA)
-{
-	if (!fsl_otg_dev)
-		return -ENODEV;
-	if (phy->otg->state == OTG_STATE_B_PERIPHERAL)
-		pr_info("FSL OTG: Draw %d mA\n", mA);
-
-	return 0;
-}
-
 /*
  * Delayed pin detect interrupt processing.
  *
@@ -856,7 +804,6 @@ static int fsl_otg_conf(struct platform_device *pdev)
 	/* initialize the otg structure */
 	fsl_otg_tc->phy.label = DRIVER_DESC;
 	fsl_otg_tc->phy.dev = &pdev->dev;
-	fsl_otg_tc->phy.set_power = fsl_otg_set_power;
 
 	fsl_otg_tc->phy.otg->usb_phy = &fsl_otg_tc->phy;
 	fsl_otg_tc->phy.otg->set_host = fsl_otg_set_host;

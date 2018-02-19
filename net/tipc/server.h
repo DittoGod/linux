@@ -36,21 +36,27 @@
 #ifndef _TIPC_SERVER_H
 #define _TIPC_SERVER_H
 
-#include "core.h"
+#include <linux/idr.h>
+#include <linux/tipc.h>
+#include <net/net_namespace.h>
 
 #define TIPC_SERVER_NAME_LEN	32
+#define TIPC_SUB_CLUSTER_SCOPE  0x20
+#define TIPC_SUB_NODE_SCOPE     0x40
+#define TIPC_SUB_NO_STATUS      0x80
 
 /**
  * struct tipc_server - TIPC server structure
  * @conn_idr: identifier set of connection
  * @idr_lock: protect the connection identifier set
  * @idr_in_use: amount of allocated identifier entry
+ * @net: network namspace instance
  * @rcvbuf_cache: memory cache of server receive buffer
  * @rcv_wq: receive workqueue
  * @send_wq: send workqueue
  * @max_rcvbuf_size: maximum permitted receive message length
  * @tipc_conn_new: callback will be called when new connection is incoming
- * @tipc_conn_shutdown: callback will be called when connection is shut down
+ * @tipc_conn_release: callback will be called before releasing the connection
  * @tipc_conn_recvmsg: callback will be called when message arrives
  * @saddr: TIPC server address
  * @name: server name
@@ -61,16 +67,18 @@ struct tipc_server {
 	struct idr conn_idr;
 	spinlock_t idr_lock;
 	int idr_in_use;
+	struct net *net;
 	struct kmem_cache *rcvbuf_cache;
 	struct workqueue_struct *rcv_wq;
 	struct workqueue_struct *send_wq;
 	int max_rcvbuf_size;
-	void *(*tipc_conn_new) (int conid);
-	void (*tipc_conn_shutdown) (int conid, void *usr_data);
-	void (*tipc_conn_recvmsg) (int conid, struct sockaddr_tipc *addr,
-				   void *usr_data, void *buf, size_t len);
+	void *(*tipc_conn_new)(int conid);
+	void (*tipc_conn_release)(int conid, void *usr_data);
+	int (*tipc_conn_recvmsg)(struct net *net, int conid,
+				 struct sockaddr_tipc *addr, void *usr_data,
+				 void *buf, size_t len);
 	struct sockaddr_tipc *saddr;
-	const char name[TIPC_SERVER_NAME_LEN];
+	char name[TIPC_SERVER_NAME_LEN];
 	int imp;
 	int type;
 };
@@ -78,13 +86,16 @@ struct tipc_server {
 int tipc_conn_sendmsg(struct tipc_server *s, int conid,
 		      struct sockaddr_tipc *addr, void *data, size_t len);
 
+bool tipc_topsrv_kern_subscr(struct net *net, u32 port, u32 type, u32 lower,
+			     u32 upper, u32 filter, int *conid);
+void tipc_topsrv_kern_unsubscr(struct net *net, int conid);
+
 /**
  * tipc_conn_terminate - terminate connection with server
  *
  * Note: Must call it in process context since it might sleep
  */
 void tipc_conn_terminate(struct tipc_server *s, int conid);
-
 int tipc_server_start(struct tipc_server *s);
 
 void tipc_server_stop(struct tipc_server *s);

@@ -212,11 +212,9 @@ void rs400_gart_fini(struct radeon_device *rdev)
 #define RS400_PTE_WRITEABLE (1 << 2)
 #define RS400_PTE_READABLE  (1 << 3)
 
-void rs400_gart_set_page(struct radeon_device *rdev, unsigned i,
-			 uint64_t addr, uint32_t flags)
+uint64_t rs400_gart_get_page_entry(uint64_t addr, uint32_t flags)
 {
 	uint32_t entry;
-	u32 *gtt = rdev->gart.ptr;
 
 	entry = (lower_32_bits(addr) & PAGE_MASK) |
 		((upper_32_bits(addr) & 0xff) << 4);
@@ -226,8 +224,14 @@ void rs400_gart_set_page(struct radeon_device *rdev, unsigned i,
 		entry |= RS400_PTE_WRITEABLE;
 	if (!(flags & RADEON_GART_PAGE_SNOOP))
 		entry |= RS400_PTE_UNSNOOPED;
-	entry = cpu_to_le32(entry);
-	gtt[i] = entry;
+	return entry;
+}
+
+void rs400_gart_set_page(struct radeon_device *rdev, unsigned i,
+			 uint64_t entry)
+{
+	u32 *gtt = rdev->gart.ptr;
+	gtt[i] = cpu_to_le32(lower_32_bits(entry));
 }
 
 int rs400_mc_wait_for_idle(struct radeon_device *rdev)
@@ -251,8 +255,8 @@ static void rs400_gpu_init(struct radeon_device *rdev)
 	/* FIXME: is this correct ? */
 	r420_pipes_init(rdev);
 	if (rs400_mc_wait_for_idle(rdev)) {
-		printk(KERN_WARNING "rs400: Failed to wait MC idle while "
-		       "programming pipes. Bad things might happen. %08x\n", RREG32(RADEON_MC_STATUS));
+		pr_warn("rs400: Failed to wait MC idle while programming pipes. Bad things might happen. %08x\n",
+			RREG32(RADEON_MC_STATUS));
 	}
 }
 

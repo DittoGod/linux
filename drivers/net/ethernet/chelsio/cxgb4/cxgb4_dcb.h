@@ -131,11 +131,23 @@ struct port_dcb_info {
 
 void cxgb4_dcb_state_init(struct net_device *);
 void cxgb4_dcb_version_init(struct net_device *);
+void cxgb4_dcb_reset(struct net_device *dev);
 void cxgb4_dcb_state_fsm(struct net_device *, enum cxgb4_dcb_state_input);
 void cxgb4_dcb_handle_fw_update(struct adapter *, const struct fw_port_cmd *);
 void cxgb4_dcb_set_caps(struct adapter *, const struct fw_port_cmd *);
 extern const struct dcbnl_rtnl_ops cxgb4_dcb_ops;
 
+static inline __u8 bitswap_1(unsigned char val)
+{
+	return ((val & 0x80) >> 7) |
+	       ((val & 0x40) >> 5) |
+	       ((val & 0x20) >> 3) |
+	       ((val & 0x10) >> 1) |
+	       ((val & 0x08) << 1) |
+	       ((val & 0x04) << 3) |
+	       ((val & 0x02) << 5) |
+	       ((val & 0x01) << 7);
+}
 #define CXGB4_DCB_ENABLED true
 
 #else /* !CONFIG_CHELSIO_T4_DCB */

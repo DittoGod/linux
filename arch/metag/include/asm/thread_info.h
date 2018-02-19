@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /* thread_info.h: Meta low-level thread information
  *
  * Copyright (C) 2002  David Howells (dhowells@redhat.com)
@@ -28,16 +29,14 @@
 /* This must be 8 byte aligned so we can ensure stack alignment. */
 struct thread_info {
 	struct task_struct *task;	/* main task structure */
-	struct exec_domain *exec_domain;	/* execution domain */
 	unsigned long flags;	/* low level flags */
 	unsigned long status;	/* thread-synchronous flags */
 	u32 cpu;		/* current CPU */
 	int preempt_count;	/* 0 => preemptable, <0 => BUG */
 
 	mm_segment_t addr_limit;	/* thread address space */
-	struct restart_block restart_block;
 
-	u8 supervisor_stack[0];
+	u8 supervisor_stack[0] __aligned(8);
 };
 
 #else /* !__ASSEMBLY__ */
@@ -69,18 +68,11 @@ struct thread_info {
 #define INIT_THREAD_INFO(tsk)			\
 {						\
 	.task		= &tsk,			\
-	.exec_domain	= &default_exec_domain,	\
 	.flags		= 0,			\
 	.cpu		= 0,			\
 	.preempt_count	= INIT_PREEMPT_COUNT,	\
 	.addr_limit	= KERNEL_DS,		\
-	.restart_block = {			\
-		.fn = do_no_restart_syscall,	\
-	},					\
 }
-
-#define init_thread_info	(init_thread_union.thread_info)
-#define init_stack		(init_thread_union.stack)
 
 /* how to get the current stack pointer from C */
 register unsigned long current_stack_pointer asm("A0StP") __used;

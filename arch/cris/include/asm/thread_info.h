@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /* thread_info.h: CRIS low-level thread information
  *
  * Copyright (C) 2002  David Howells (dhowells@redhat.com)
@@ -19,6 +20,13 @@
 #endif
 
 
+/* THREAD_SIZE is the size of the thread_info/kernel_stack combo.
+ * normally, the stack is found by doing something like p + THREAD_SIZE
+ * in CRIS, a page is 8192 bytes, which seems like a sane size
+ */
+#define THREAD_SIZE       PAGE_SIZE
+#define THREAD_SIZE_ORDER (0)
+
 /*
  * low level task data that entry.S needs immediate access to
  * - this struct should fit entirely inside of one cache line
@@ -28,7 +36,6 @@
 #ifndef __ASSEMBLY__
 struct thread_info {
 	struct task_struct	*task;		/* main task structure */
-	struct exec_domain	*exec_domain;	/* execution domain */
 	unsigned long		flags;		/* low level flags */
 	__u32			cpu;		/* current CPU */
 	int			preempt_count;	/* 0 => preemptable, <0 => BUG */
@@ -38,7 +45,6 @@ struct thread_info {
 					 	   0-0xBFFFFFFF for user-thead
 						   0-0xFFFFFFFF for kernel-thread
 						*/
-	struct restart_block    restart_block;
 	__u8			supervisor_stack[0];
 };
 
@@ -51,17 +57,11 @@ struct thread_info {
 #define INIT_THREAD_INFO(tsk)				\
 {							\
 	.task		= &tsk,				\
-	.exec_domain	= &default_exec_domain,		\
 	.flags		= 0,				\
 	.cpu		= 0,				\
 	.preempt_count	= INIT_PREEMPT_COUNT,		\
 	.addr_limit	= KERNEL_DS,			\
-	.restart_block = {				\
-		       .fn = do_no_restart_syscall,	\
-	},						\
 }
-
-#define init_thread_info	(init_thread_union.thread_info)
 
 #endif /* !__ASSEMBLY__ */
 

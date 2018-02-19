@@ -36,7 +36,7 @@ static int mxs_sgtl5000_hw_params(struct snd_pcm_substream *substream,
 	struct snd_soc_dai *codec_dai = rtd->codec_dai;
 	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
 	unsigned int rate = params_rate(params);
-	u32 dai_format, mclk;
+	u32 mclk;
 	int ret;
 
 	/* sgtl5000 does not support 512*rate when in 96000 fs */
@@ -65,47 +65,40 @@ static int mxs_sgtl5000_hw_params(struct snd_pcm_substream *substream,
 		return ret;
 	}
 
-	/* set codec to slave mode */
-	dai_format = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
-			SND_SOC_DAIFMT_CBS_CFS;
-
-	/* set codec DAI configuration */
-	ret = snd_soc_dai_set_fmt(codec_dai, dai_format);
-	if (ret) {
-		dev_err(codec_dai->dev, "Failed to set dai format to %08x\n",
-			dai_format);
-		return ret;
-	}
-
-	/* set cpu DAI configuration */
-	ret = snd_soc_dai_set_fmt(cpu_dai, dai_format);
-	if (ret) {
-		dev_err(cpu_dai->dev, "Failed to set dai format to %08x\n",
-			dai_format);
-		return ret;
-	}
-
 	return 0;
 }
 
-static struct snd_soc_ops mxs_sgtl5000_hifi_ops = {
+static const struct snd_soc_ops mxs_sgtl5000_hifi_ops = {
 	.hw_params = mxs_sgtl5000_hw_params,
 };
+
+#define MXS_SGTL5000_DAI_FMT (SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF | \
+	SND_SOC_DAIFMT_CBS_CFS)
 
 static struct snd_soc_dai_link mxs_sgtl5000_dai[] = {
 	{
 		.name		= "HiFi Tx",
 		.stream_name	= "HiFi Playback",
 		.codec_dai_name	= "sgtl5000",
+		.dai_fmt	= MXS_SGTL5000_DAI_FMT,
 		.ops		= &mxs_sgtl5000_hifi_ops,
 		.playback_only	= true,
 	}, {
 		.name		= "HiFi Rx",
 		.stream_name	= "HiFi Capture",
 		.codec_dai_name	= "sgtl5000",
+		.dai_fmt	= MXS_SGTL5000_DAI_FMT,
 		.ops		= &mxs_sgtl5000_hifi_ops,
 		.capture_only	= true,
 	},
+};
+
+static const struct snd_soc_dapm_widget mxs_sgtl5000_dapm_widgets[] = {
+	SND_SOC_DAPM_MIC("Mic Jack", NULL),
+	SND_SOC_DAPM_LINE("Line In Jack", NULL),
+	SND_SOC_DAPM_HP("Headphone Jack", NULL),
+	SND_SOC_DAPM_SPK("Line Out Jack", NULL),
+	SND_SOC_DAPM_SPK("Ext Spk", NULL),
 };
 
 static struct snd_soc_card mxs_sgtl5000 = {
@@ -155,12 +148,24 @@ static int mxs_sgtl5000_probe(struct platform_device *pdev)
 	}
 
 	card->dev = &pdev->dev;
-	platform_set_drvdata(pdev, card);
 
-	ret = snd_soc_register_card(card);
+	if (of_find_property(np, "audio-routing", NULL)) {
+		card->dapm_widgets = mxs_sgtl5000_dapm_widgets;
+		card->num_dapm_widgets = ARRAY_SIZE(mxs_sgtl5000_dapm_widgets);
+
+		ret = snd_soc_of_parse_audio_routing(card, "audio-routing");
+		if (ret) {
+			dev_err(&pdev->dev, "failed to parse audio-routing (%d)\n",
+				ret);
+			return ret;
+		}
+	}
+
+	ret = devm_snd_soc_register_card(&pdev->dev, card);
 	if (ret) {
-		dev_err(&pdev->dev, "snd_soc_register_card failed (%d)\n",
-			ret);
+		if (ret != -EPROBE_DEFER)
+			dev_err(&pdev->dev, "snd_soc_register_card failed (%d)\n",
+				ret);
 		return ret;
 	}
 
@@ -169,11 +174,7 @@ static int mxs_sgtl5000_probe(struct platform_device *pdev)
 
 static int mxs_sgtl5000_remove(struct platform_device *pdev)
 {
-	struct snd_soc_card *card = platform_get_drvdata(pdev);
-
 	mxs_saif_put_mclk(0);
-
-	snd_soc_unregister_card(card);
 
 	return 0;
 }

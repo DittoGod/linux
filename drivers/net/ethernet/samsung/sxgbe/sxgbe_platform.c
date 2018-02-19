@@ -47,6 +47,8 @@ static int sxgbe_probe_config_dt(struct platform_device *pdev,
 	plat->mdio_bus_data = devm_kzalloc(&pdev->dev,
 					   sizeof(*plat->mdio_bus_data),
 					   GFP_KERNEL);
+	if (!plat->mdio_bus_data)
+		return -ENOMEM;
 
 	dma_cfg = devm_kzalloc(&pdev->dev, sizeof(*dma_cfg), GFP_KERNEL);
 	if (!dma_cfg)
@@ -108,10 +110,6 @@ static int sxgbe_platform_probe(struct platform_device *pdev)
 		}
 	}
 
-	/* Get MAC address if available (DT) */
-	if (mac)
-		ether_addr_copy(priv->dev->dev_addr, mac);
-
 	priv = sxgbe_drv_probe(&(pdev->dev), plat_dat, addr);
 	if (!priv) {
 		pr_err("%s: main driver probe failed\n", __func__);
@@ -124,6 +122,10 @@ static int sxgbe_platform_probe(struct platform_device *pdev)
 		dev_err(dev, "sxgbe common irq parsing failed\n");
 		goto err_drv_remove;
 	}
+
+	/* Get MAC address if available (DT) */
+	if (mac)
+		ether_addr_copy(priv->dev->dev_addr, mac);
 
 	/* Get the TX/RX IRQ numbers */
 	for (i = 0, chan = 1; i < SXGBE_TX_QUEUES; i++) {
@@ -155,11 +157,11 @@ static int sxgbe_platform_probe(struct platform_device *pdev)
 	return 0;
 
 err_rx_irq_unmap:
-	while (--i)
+	while (i--)
 		irq_dispose_mapping(priv->rxq[i]->irq_no);
 	i = SXGBE_TX_QUEUES;
 err_tx_irq_unmap:
-	while (--i)
+	while (i--)
 		irq_dispose_mapping(priv->txq[i]->irq_no);
 	irq_dispose_mapping(priv->irq);
 err_drv_remove:

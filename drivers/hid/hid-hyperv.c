@@ -313,7 +313,7 @@ static void mousevsc_on_receive(struct hv_device *device,
 
 		break;
 	default:
-		pr_err("unsupported hid msg type - type %d len %d",
+		pr_err("unsupported hid msg type - type %d len %d\n",
 		       hid_msg->header.type, hid_msg->header.size);
 		break;
 	}
@@ -381,7 +381,7 @@ static void mousevsc_on_channel_callback(void *context)
 static int mousevsc_connect_to_vsp(struct hv_device *device)
 {
 	int ret = 0;
-	int t;
+	unsigned long t;
 	struct mousevsc_dev *input_dev = hv_get_drvdata(device);
 	struct mousevsc_prt_msg *request;
 	struct mousevsc_prt_msg *response;
