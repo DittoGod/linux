@@ -780,7 +780,10 @@ noinline static void slc_entire_op(const int op)
 
 	write_aux_reg(r, ctrl);
 
-	write_aux_reg(ARC_REG_SLC_INVALIDATE, 1);
+	if (op & OP_INV)	/* Inv or flush-n-inv use same cmd reg */
+		write_aux_reg(ARC_REG_SLC_INVALIDATE, 0x1);
+	else
+		write_aux_reg(ARC_REG_SLC_FLUSH, 0x1);
 
 	/* Make sure "busy" bit reports correct stataus, see STAR 9001165532 */
 	read_aux_reg(r);
@@ -830,7 +833,7 @@ void flush_dcache_page(struct page *page)
 	}
 
 	/* don't handle anon pages here */
-	mapping = page_mapping(page);
+	mapping = page_mapping_file(page);
 	if (!mapping)
 		return;
 
@@ -1035,7 +1038,7 @@ void flush_cache_mm(struct mm_struct *mm)
 void flush_cache_page(struct vm_area_struct *vma, unsigned long u_vaddr,
 		      unsigned long pfn)
 {
-	unsigned int paddr = pfn << PAGE_SHIFT;
+	phys_addr_t paddr = pfn << PAGE_SHIFT;
 
 	u_vaddr &= PAGE_MASK;
 
@@ -1055,8 +1058,9 @@ void flush_anon_page(struct vm_area_struct *vma, struct page *page,
 		     unsigned long u_vaddr)
 {
 	/* TBD: do we really need to clear the kernel mapping */
-	__flush_dcache_page(page_address(page), u_vaddr);
-	__flush_dcache_page(page_address(page), page_address(page));
+	__flush_dcache_page((phys_addr_t)page_address(page), u_vaddr);
+	__flush_dcache_page((phys_addr_t)page_address(page),
+			    (phys_addr_t)page_address(page));
 
 }
 
@@ -1242,6 +1246,16 @@ void __init arc_cache_init_master(void)
 			}
 		}
 	}
+
+	/*
+	 * Check that SMP_CACHE_BYTES (and hence ARCH_DMA_MINALIGN) is larger
+	 * or equal to any cache line length.
+	 */
+	BUILD_BUG_ON_MSG(L1_CACHE_BYTES > SMP_CACHE_BYTES,
+			 "SMP_CACHE_BYTES must be >= any cache line length");
+	if (is_isa_arcv2() && (l2_line_sz > SMP_CACHE_BYTES))
+		panic("L2 Cache line [%d] > kernel Config [%d]\n",
+		      l2_line_sz, SMP_CACHE_BYTES);
 
 	/* Note that SLC disable not formally supported till HS 3.0 */
 	if (is_isa_arcv2() && l2_line_sz && !slc_enable)

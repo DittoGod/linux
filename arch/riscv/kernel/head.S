@@ -64,7 +64,7 @@ ENTRY(_start)
 	/* Start the kernel */
 	mv a0, s0
 	mv a1, s1
-	call sbi_save
+	call parse_dtb
 	tail start_kernel
 
 relocate:
@@ -94,6 +94,7 @@ relocate:
 	or a0, a0, a1
 	sfence.vma
 	csrw sptbr, a0
+.align 2
 1:
 	/* Set trap vector to spin forever to help debug */
 	la a0, .Lsecondary_park
@@ -143,6 +144,7 @@ relocate:
 	tail smp_callin
 #endif
 
+.align 2
 .Lsecondary_park:
 	/* We lack SMP support or have too many harts, so park this hart */
 	wfi

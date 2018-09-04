@@ -266,7 +266,7 @@ void rxrpc_kill_connection(struct rxrpc_connection *conn)
 bool rxrpc_queue_conn(struct rxrpc_connection *conn)
 {
 	const void *here = __builtin_return_address(0);
-	int n = __atomic_add_unless(&conn->usage, 1, 0);
+	int n = atomic_fetch_add_unless(&conn->usage, 1, 0);
 	if (n == 0)
 		return false;
 	if (rxrpc_queue_work(&conn->processor))
@@ -309,7 +309,7 @@ rxrpc_get_connection_maybe(struct rxrpc_connection *conn)
 	const void *here = __builtin_return_address(0);
 
 	if (conn) {
-		int n = __atomic_add_unless(&conn->usage, 1, 0);
+		int n = atomic_fetch_add_unless(&conn->usage, 1, 0);
 		if (n > 0)
 			trace_rxrpc_conn(conn, rxrpc_conn_got, n + 1, here);
 		else
@@ -365,6 +365,9 @@ static void rxrpc_destroy_connection(struct rcu_head *rcu)
 	key_put(conn->params.key);
 	key_put(conn->server_key);
 	rxrpc_put_peer(conn->params.peer);
+
+	if (atomic_dec_and_test(&conn->params.local->rxnet->nr_conns))
+		wake_up_var(&conn->params.local->rxnet->nr_conns);
 	rxrpc_put_local(conn->params.local);
 
 	kfree(conn);
@@ -418,7 +421,7 @@ void rxrpc_service_connection_reaper(struct work_struct *work)
 		 */
 		if (atomic_cmpxchg(&conn->usage, 1, 0) != 1)
 			continue;
-		trace_rxrpc_conn(conn, rxrpc_conn_reap_service, 0, 0);
+		trace_rxrpc_conn(conn, rxrpc_conn_reap_service, 0, NULL);
 
 		if (rxrpc_conn_is_client(conn))
 			BUG();
@@ -458,6 +461,7 @@ void rxrpc_destroy_all_connections(struct rxrpc_net *rxnet)
 
 	_enter("");
 
+	atomic_dec(&rxnet->nr_conns);
 	rxrpc_destroy_all_client_connections(rxnet);
 
 	del_timer_sync(&rxnet->service_conn_reap_timer);
@@ -475,5 +479,9 @@ void rxrpc_destroy_all_connections(struct rxrpc_net *rxnet)
 
 	ASSERT(list_empty(&rxnet->conn_proc_list));
 
+	/* We need to wait for the connections to be destroyed by RCU as they
+	 * pin things that we still need to get rid of.
+	 */
+	wait_var_event(&rxnet->nr_conns, !atomic_read(&rxnet->nr_conns));
 	_leave("");
 }

@@ -512,7 +512,7 @@ int tipc_bcast_init(struct net *net)
 	struct tipc_bc_base *bb = NULL;
 	struct tipc_link *l = NULL;
 
-	bb = kzalloc(sizeof(*bb), GFP_ATOMIC);
+	bb = kzalloc(sizeof(*bb), GFP_KERNEL);
 	if (!bb)
 		goto enomem;
 	tn->bcbase = bb;
@@ -574,5 +574,5 @@ void tipc_nlist_purge(struct tipc_nlist *nl)
 {
 	tipc_dest_list_purge(&nl->list);
 	nl->remote = 0;
-	nl->local = 0;
+	nl->local = false;
 }

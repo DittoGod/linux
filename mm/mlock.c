@@ -64,6 +64,12 @@ void clear_page_mlock(struct page *page)
 	mod_zone_page_state(page_zone(page), NR_MLOCK,
 			    -hpage_nr_pages(page));
 	count_vm_event(UNEVICTABLE_PGCLEARED);
+	/*
+	 * The previous TestClearPageMlocked() corresponds to the smp_mb()
+	 * in __pagevec_lru_add_fn().
+	 *
+	 * See __pagevec_lru_add_fn for more explanation.
+	 */
 	if (!isolate_lru_page(page)) {
 		putback_lru_page(page);
 	} else {
@@ -521,7 +527,8 @@ static int mlock_fixup(struct vm_area_struct *vma, struct vm_area_struct **prev,
 	vm_flags_t old_flags = vma->vm_flags;
 
 	if (newflags == vma->vm_flags || (vma->vm_flags & VM_SPECIAL) ||
-	    is_vm_hugetlb_page(vma) || vma == get_gate_vma(current->mm))
+	    is_vm_hugetlb_page(vma) || vma == get_gate_vma(current->mm) ||
+	    vma_is_dax(vma))
 		/* don't set VM_LOCKED or VM_LOCKONFAULT and don't count */
 		goto out;
 

@@ -748,13 +748,11 @@ static void uss720_disconnect(struct usb_interface *intf)
 {
 	struct parport *pp = usb_get_intfdata(intf);
 	struct parport_uss720_private *priv;
-	struct usb_device *usbdev;
 
 	dev_dbg(&intf->dev, "disconnect\n");
 	usb_set_intfdata(intf, NULL);
 	if (pp) {
 		priv = pp->private_data;
-		usbdev = priv->usbdev;
 		priv->usbdev = NULL;
 		priv->pp = NULL;
 		dev_dbg(&intf->dev, "parport_remove_port\n");
@@ -769,10 +767,15 @@ static void uss720_disconnect(struct usb_interface *intf)
 /* table of cables that work through this driver */
 static const struct usb_device_id uss720_table[] = {
 	{ USB_DEVICE(0x047e, 0x1001) },
+	{ USB_DEVICE(0x04b8, 0x0002) },
+	{ USB_DEVICE(0x04b8, 0x0003) },
+	{ USB_DEVICE(0x050d, 0x0002) },
+	{ USB_DEVICE(0x050d, 0x1202) },
 	{ USB_DEVICE(0x0557, 0x2001) },
+	{ USB_DEVICE(0x05ab, 0x0002) },
+	{ USB_DEVICE(0x06c6, 0x0100) },
 	{ USB_DEVICE(0x0729, 0x1284) },
 	{ USB_DEVICE(0x1293, 0x0002) },
-	{ USB_DEVICE(0x050d, 0x0002) },
 	{ }						/* Terminating entry */
 };
 
